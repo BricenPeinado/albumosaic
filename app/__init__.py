@@ -1,0 +1,1 @@
+"""Albumosaic application package."""

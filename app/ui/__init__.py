@@ -1,0 +1,1 @@
+"""Albumosaic user-interface package."""
