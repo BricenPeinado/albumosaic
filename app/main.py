@@ -1,5 +1,6 @@
 """Command-line entry point for Albumosaic."""
 
+import logging
 from argparse import ArgumentParser, Namespace
 from collections.abc import Sequence
 
@@ -16,12 +17,20 @@ def parse_args(argv: Sequence[str] | None = None) -> Namespace:
         action="store_true",
         help="Request a temporary public Gradio share link",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable credential-safe OAuth diagnostics",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Launch the local Albumosaic web interface."""
     args = parse_args(argv)
+    if args.debug:
+        logging.basicConfig(level=logging.WARNING)
+        logging.getLogger("app.playlist.spotify_auth").setLevel(logging.DEBUG)
     interface = build_interface()
     interface.launch(
         show_error=True,

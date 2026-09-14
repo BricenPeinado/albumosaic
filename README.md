@@ -127,6 +127,16 @@ Spotify is used only for playlist, track, and album identity metadata.
 Spotify-hosted artwork URLs are discarded even when present in API or Exportify
 responses; they are never downloaded, cached, transformed, or rendered.
 
+If Spotify authorization fails, restart with credential-safe PKCE diagnostics:
+
+```bash
+python -m app.main --debug
+```
+
+Debug output includes only the Client ID suffix, redirect URIs, verifier presence
+and length, and the token endpoint status. It never logs authorization codes,
+PKCE verifier contents, access tokens, or refresh tokens.
+
 ## Artwork cache
 
 Artwork resolution prioritizes an optional user-owned local manifest, then

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from base64 import urlsafe_b64encode
 from dataclasses import dataclass
 from hashlib import sha256
@@ -23,6 +24,8 @@ _TOKEN_URL = "https://accounts.spotify.com/api/token"
 _DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/spotify/callback"
 _SCOPES = "playlist-read-private playlist-read-collaborative"
 
+logger = logging.getLogger(__name__)
+
 
 class SpotifyConfigurationError(RuntimeError):
     """Raised when local Spotify application configuration is unavailable."""
@@ -42,18 +45,9 @@ class SpotifyOAuthConfig:
     def __post_init__(self) -> None:
         if not self.client_id.strip():
             raise SpotifyConfigurationError("SPOTIFY_CLIENT_ID cannot be empty")
-        parsed = urlparse(self.redirect_uri)
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname != "127.0.0.1"
-            or parsed.port is None
-            or parsed.path != "/spotify/callback"
-            or parsed.query
-            or parsed.fragment
-        ):
+        if self.redirect_uri != _DEFAULT_REDIRECT_URI:
             raise SpotifyConfigurationError(
-                "SPOTIFY_REDIRECT_URI must be an HTTP 127.0.0.1 callback ending "
-                "in /spotify/callback and containing an explicit port"
+                f"SPOTIFY_REDIRECT_URI must be exactly {_DEFAULT_REDIRECT_URI}"
             )
 
     @classmethod
@@ -83,6 +77,14 @@ class SpotifyToken:
     expires_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingAuthorization:
+    """PKCE material retained for one OAuth state."""
+
+    code_verifier: str
+    redirect_uri: str
+
+
 class SpotifyOAuthManager:
     """Create PKCE authorization requests and refresh in-memory tokens."""
 
@@ -92,8 +94,7 @@ class SpotifyOAuthManager:
         self.config = config
         self.timeout = timeout
         self._token: SpotifyToken | None = None
-        self._state: str | None = None
-        self._verifier: str | None = None
+        self._pending_authorizations: dict[str, _PendingAuthorization] = {}
         self._lock = RLock()
 
     @property
@@ -110,10 +111,20 @@ class SpotifyOAuthManager:
         """Create and retain a secure PKCE authorization request."""
         verifier = token_urlsafe(64)
         state = token_urlsafe(32)
-        challenge = urlsafe_b64encode(sha256(verifier.encode()).digest()).rstrip(b"=")
+        challenge = _pkce_challenge(verifier)
         with self._lock:
-            self._state = state
-            self._verifier = verifier
+            self._pending_authorizations[state] = _PendingAuthorization(
+                code_verifier=verifier,
+                redirect_uri=self.config.redirect_uri,
+            )
+        logger.debug(
+            "Starting Spotify PKCE authorization: client_id_present=%s, "
+            "client_id_suffix=%s, authorize_redirect_uri=%s, verifier_length=%d",
+            bool(self.config.client_id),
+            self.config.client_id[-4:],
+            self.config.redirect_uri,
+            len(verifier),
+        )
         query = urlencode(
             {
                 "client_id": self.config.client_id,
@@ -122,7 +133,7 @@ class SpotifyOAuthManager:
                 "state": state,
                 "scope": _SCOPES,
                 "code_challenge_method": "S256",
-                "code_challenge": challenge.decode("ascii"),
+                "code_challenge": challenge,
             }
         )
         return f"{_AUTHORIZE_URL}?{query}"
@@ -132,14 +143,17 @@ class SpotifyOAuthManager:
         if callback_timeout <= 0:
             raise ValueError("Spotify callback timeout must be positive")
         authorization_url = self.begin_authorization()
+        authorization_state = parse_qs(urlparse(authorization_url).query)["state"][0]
         parsed = urlparse(self.config.redirect_uri)
         manager = self
+        callback_errors: list[SpotifyAuthenticationError] = []
 
         class CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 try:
                     manager.complete_callback(self.path)
                 except SpotifyAuthenticationError as error:
+                    callback_errors.append(error)
                     self.send_response(400)
                     message = f"Spotify connection failed: {error}".encode()
                 else:
@@ -160,12 +174,15 @@ class SpotifyOAuthManager:
         try:
             if not open_browser(authorization_url):
                 raise SpotifyAuthenticationError(
-                    f"Could not open a browser. Open this URL manually: {authorization_url}"
+                    "Could not open a browser for Spotify authorization"
                 )
             server.handle_request()
         finally:
             server.server_close()
+            self._discard_authorization(authorization_state)
         if not self.is_connected:
+            if callback_errors:
+                raise callback_errors[0]
             raise SpotifyAuthenticationError(
                 "Spotify authorization timed out or failed"
             )
@@ -176,32 +193,66 @@ class SpotifyOAuthManager:
         if parsed.path != "/spotify/callback":
             raise SpotifyAuthenticationError("Invalid Spotify callback path")
         values = parse_qs(parsed.query)
-        if "error" in values:
-            raise SpotifyAuthenticationError(
-                f"Spotify authorization was denied: {values['error'][0]}"
-            )
         state = values.get("state", [""])[0]
         code = values.get("code", [""])[0]
-        with self._lock:
-            expected_state = self._state
-            verifier = self._verifier
-        if not expected_state or not compare_digest(state, expected_state):
+        authorization = self._consume_authorization(state)
+        verifier_found = bool(authorization and authorization.code_verifier)
+        logger.debug(
+            "Spotify callback PKCE lookup: verifier_found=%s, verifier_length=%d",
+            verifier_found,
+            len(authorization.code_verifier) if authorization else 0,
+        )
+        if authorization is None:
             raise SpotifyAuthenticationError("Invalid Spotify OAuth state")
-        if not code or not verifier:
+        if "error" in values:
+            oauth_error = _safe_error_text(values["error"][0])
+            raise SpotifyAuthenticationError(
+                f"Spotify authorization was denied: {oauth_error or 'unknown error'}"
+            )
+        if not authorization.code_verifier:
+            raise SpotifyAuthenticationError(
+                "Spotify OAuth state has no associated PKCE verifier"
+            )
+        if not code:
             raise SpotifyAuthenticationError("Spotify callback contained no code")
+        logger.debug(
+            "Exchanging Spotify authorization code: token_redirect_uri=%s",
+            authorization.redirect_uri,
+        )
         payload = self._token_request(
             {
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": self.config.redirect_uri,
+                "redirect_uri": authorization.redirect_uri,
                 "client_id": self.config.client_id,
-                "code_verifier": verifier,
+                "code_verifier": authorization.code_verifier,
             }
         )
         self._store_token(payload, previous_refresh_token=None)
+
+    def _consume_authorization(
+        self, callback_state: str
+    ) -> _PendingAuthorization | None:
+        """Atomically validate and consume one pending OAuth state."""
+        if not callback_state:
+            return None
         with self._lock:
-            self._state = None
-            self._verifier = None
+            matching_state = next(
+                (
+                    pending_state
+                    for pending_state in self._pending_authorizations
+                    if compare_digest(callback_state, pending_state)
+                ),
+                None,
+            )
+            if matching_state is None:
+                return None
+            return self._pending_authorizations.pop(matching_state)
+
+    def _discard_authorization(self, state: str) -> None:
+        """Remove unconsumed PKCE material after a callback server exits."""
+        with self._lock:
+            self._pending_authorizations.pop(state, None)
 
     def access_token(self) -> str:
         """Return a valid token, refreshing it shortly before expiration."""
@@ -231,19 +282,28 @@ class SpotifyOAuthManager:
     def _token_request(self, form: dict[str, str]) -> dict[str, object]:
         request = Request(
             _TOKEN_URL,
-            data=urlencode(form).encode(),
+            data=urlencode(form).encode("ascii"),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
-                return _json_object(response.read())
+                status = response.getcode()
+                logger.debug("Spotify token endpoint HTTP status: %d", status)
+                payload = _json_object(response.read())
         except HTTPError as error:
-            raise SpotifyAuthenticationError(
-                f"Spotify token request returned HTTP {error.code}"
-            ) from error
+            logger.debug("Spotify token endpoint HTTP status: %d", error.code)
+            raise SpotifyAuthenticationError(_token_error_message(error)) from error
         except (TimeoutError, URLError, OSError) as error:
-            raise SpotifyAuthenticationError("Spotify token request failed") from error
+            detail = _safe_error_text(getattr(error, "reason", error))
+            suffix = f": {detail}" if detail else ""
+            raise SpotifyAuthenticationError(
+                f"Spotify token request failed{suffix}"
+            ) from error
+        oauth_error = _oauth_error_message(payload)
+        if oauth_error is not None:
+            raise SpotifyAuthenticationError(oauth_error)
+        return payload
 
     def _store_token(
         self,
@@ -275,3 +335,37 @@ def _json_object(payload: bytes) -> dict[str, object]:
     if not isinstance(decoded, dict):
         raise SpotifyAuthenticationError("Spotify returned an invalid JSON response")
     return cast(dict[str, object], decoded)
+
+
+def _pkce_challenge(verifier: str) -> str:
+    """Return the RFC 7636 S256 challenge for a PKCE verifier."""
+    digest = sha256(verifier.encode("ascii")).digest()
+    return urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _token_error_message(error: HTTPError) -> str:
+    """Extract only Spotify's safe OAuth error fields from an HTTP failure."""
+    try:
+        payload = _json_object(error.read())
+    except SpotifyAuthenticationError:
+        return f"Spotify token request failed (HTTP {error.code})"
+    return _oauth_error_message(payload) or (
+        f"Spotify token request failed (HTTP {error.code})"
+    )
+
+
+def _oauth_error_message(payload: dict[str, object]) -> str | None:
+    oauth_error = _safe_error_text(payload.get("error"))
+    if not oauth_error:
+        return None
+    description = _safe_error_text(payload.get("error_description"))
+    message = f"Spotify token request failed ({oauth_error})"
+    return f"{message}: {description}" if description else message
+
+
+def _safe_error_text(value: object, *, maximum_length: int = 300) -> str:
+    """Bound and normalize a non-secret OAuth or transport error value."""
+    if not isinstance(value, (str, OSError)):
+        return ""
+    text = " ".join(str(value).split())
+    return text[:maximum_length]
