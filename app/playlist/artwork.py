@@ -1,5 +1,7 @@
 """Concurrent, validated, disk-backed album artwork retrieval."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -10,13 +12,17 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Lock
 from time import sleep
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from PIL import Image, UnidentifiedImageError
 
-from app.playlist.models import Album, deduplicate_albums
+from app.playlist.models import Album
+
+if TYPE_CHECKING:
+    from app.playlist.artwork_sources import ArtworkReference
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _DEFAULT_RETRIES = 2
@@ -25,6 +31,7 @@ _MAX_WORKERS = 16
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 _DEFAULT_MAX_ARTWORK_PIXELS = 25_000_000
 _RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+_SPOTIFY_ARTWORK_HOSTS = ("scdn.co", "spotifycdn.com")
 
 
 class ArtworkCacheError(RuntimeError):
@@ -47,7 +54,7 @@ class ArtworkCacheMetadata:
     album_id: str | None
     album_name: str
     artists: tuple[str, ...]
-    artwork_url: str
+    artwork_origin: str
     content_type: str
     content_sha256: str
     width: int
@@ -68,6 +75,7 @@ class ArtworkCache:
         max_workers: int = _DEFAULT_MAX_WORKERS,
         max_download_bytes: int = _MAX_DOWNLOAD_BYTES,
         max_artwork_pixels: int = _DEFAULT_MAX_ARTWORK_PIXELS,
+        allowed_hosts: set[str] | None = None,
     ) -> None:
         if timeout <= 0:
             raise ValueError("Artwork timeout must be positive")
@@ -93,6 +101,11 @@ class ArtworkCache:
         self.max_workers = max_workers
         self.max_download_bytes = max_download_bytes
         self.max_artwork_pixels = max_artwork_pixels
+        self.allowed_hosts = (
+            frozenset(host.casefold() for host in allowed_hosts)
+            if allowed_hosts is not None
+            else None
+        )
         self.artwork_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, Lock] = {}
@@ -103,28 +116,38 @@ class ArtworkCache:
         identity = "\x1f".join(album.identity_key)
         return sha256(identity.encode("utf-8")).hexdigest()
 
-    def get(self, album: Album) -> Path:
-        """Return cached artwork, downloading and validating it when absent."""
-        cache_key = self.cache_key(album)
+    def get(self, album: Album, reference: ArtworkReference) -> Path:
+        """Cache a validated independent URL or user-provided local image."""
+        identity = "\x1f".join(
+            (*album.identity_key, reference.provider, reference.identifier)
+        )
+        cache_key = sha256(identity.encode("utf-8")).hexdigest()
         artwork_path = self.artwork_dir / f"{cache_key}.png"
-        album_lock = self._lock_for(cache_key)
-        with album_lock:
+        with self._lock_for(cache_key):
             if _valid_cached_artwork(artwork_path, self.max_artwork_pixels):
                 return artwork_path
-
-            artwork_url = album.artwork_url
-            if artwork_url is None:
-                raise ArtworkDownloadError(
-                    f"Album has no artwork URL: {album.album_name}"
-                )
-            payload, content_type = self._download(artwork_url)
+            if reference.local_path is not None:
+                try:
+                    payload = reference.local_path.read_bytes()
+                except OSError as error:
+                    raise ArtworkDownloadError(
+                        f"Could not read local artwork: {reference.local_path}"
+                    ) from error
+                if len(payload) > self.max_download_bytes:
+                    raise ArtworkValidationError("Local artwork exceeds download limit")
+                content_type = "image/local"
+                origin = str(reference.local_path)
+            else:
+                assert reference.url is not None
+                payload, content_type = self._download(reference.url)
+                origin = reference.url
             image = _decode_square_rgb(payload, album, self.max_artwork_pixels)
             metadata = ArtworkCacheMetadata(
                 cache_key=cache_key,
                 album_id=album.album_id,
                 album_name=album.album_name,
                 artists=album.artists,
-                artwork_url=artwork_url,
+                artwork_origin=origin,
                 content_type=content_type,
                 content_sha256=sha256(payload).hexdigest(),
                 width=image.width,
@@ -141,13 +164,21 @@ class ArtworkCache:
                 raise
             return artwork_path
 
-    def get_many(self, albums: Sequence[Album]) -> tuple[Path, ...]:
-        """Cache unique albums concurrently while retaining playlist order."""
-        unique_albums = deduplicate_albums(albums)
-        if not unique_albums:
+    def get_many(
+        self,
+        references: Sequence[tuple[Album, ArtworkReference]],
+    ) -> tuple[Path, ...]:
+        """Cache independently resolved artwork concurrently in input order."""
+        unique: dict[tuple[str, ...], tuple[Album, ArtworkReference]] = {}
+        for album, reference in references:
+            unique.setdefault(album.identity_key, (album, reference))
+        if not unique:
             return ()
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            return tuple(executor.map(self.get, unique_albums))
+            return tuple(executor.map(self._get_pair, unique.values()))
+
+    def _get_pair(self, pair: tuple[Album, ArtworkReference]) -> Path:
+        return self.get(*pair)
 
     def _download(self, artwork_url: str) -> tuple[bytes, str]:
         parsed_url = urlparse(artwork_url)
@@ -158,6 +189,16 @@ class ArtworkCache:
             raise ArtworkDownloadError(
                 f"Artwork URL must use HTTP or HTTPS: {artwork_url}"
             )
+        hostname = parsed_url.hostname.casefold()
+        if any(
+            hostname == blocked or hostname.endswith(f".{blocked}")
+            for blocked in _SPOTIFY_ARTWORK_HOSTS
+        ):
+            raise ArtworkDownloadError("Spotify-hosted artwork is not permitted")
+        if self.allowed_hosts is not None and not _host_allowed(
+            hostname, self.allowed_hosts
+        ):
+            raise ArtworkDownloadError(f"Artwork host is not allowed: {hostname}")
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
@@ -185,6 +226,13 @@ class ArtworkCache:
             headers={"User-Agent": "Albumosaic/0.1"},
         )
         with urlopen(request, timeout=self.timeout) as response:
+            final_url = getattr(response, "geturl", lambda: artwork_url)()
+            final_host = urlparse(final_url).hostname
+            if self.allowed_hosts is not None and (
+                final_host is None
+                or not _host_allowed(final_host.casefold(), self.allowed_hosts)
+            ):
+                raise ArtworkDownloadError("Artwork redirected to a disallowed host")
             status = response.getcode()
             if status is None or not 200 <= status < 300:
                 if status in _RETRYABLE_HTTP_STATUSES:
@@ -218,23 +266,6 @@ class ArtworkCache:
     def _lock_for(self, cache_key: str) -> Lock:
         with self._locks_guard:
             return self._locks.setdefault(cache_key, Lock())
-
-
-def cache_artwork(
-    albums: Sequence[Album],
-    cache_dir: Path,
-    *,
-    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
-    retries: int = _DEFAULT_RETRIES,
-    max_workers: int = _DEFAULT_MAX_WORKERS,
-) -> tuple[Path, ...]:
-    """Convenience wrapper returning local paths for unique album artwork."""
-    return ArtworkCache(
-        cache_root=cache_dir,
-        timeout=timeout,
-        retries=retries,
-        max_workers=max_workers,
-    ).get_many(albums)
 
 
 def _decode_square_rgb(
@@ -320,3 +351,10 @@ def _save_metadata_atomically(
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _host_allowed(hostname: str, allowed_hosts: frozenset[str]) -> bool:
+    return any(
+        hostname == allowed or hostname.endswith(f".{allowed}")
+        for allowed in allowed_hosts
+    )

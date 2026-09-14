@@ -12,7 +12,6 @@ def album(
         album_id=album_id,
         album_name=album_name,
         artists=artists,
-        artwork_url=f"https://images.example/{album_name}.jpg",
         source_url=f"https://music.example/{album_id or album_name}",
     )
 

@@ -19,6 +19,7 @@ from app.playlist.artwork import (
     ArtworkDownloadError,
     ArtworkValidationError,
 )
+from app.playlist.artwork_sources import ArtworkReference
 from app.playlist.models import Album
 
 
@@ -53,15 +54,19 @@ def make_album(
     *,
     album_name: str = "Album",
     artist: str = "Artist",
-    artwork_url: str | None = "https://images.example/cover.png",
 ) -> Album:
     return Album(
         album_id=album_id,
         album_name=album_name,
         artists=(artist,),
-        artwork_url=artwork_url,
         source_url=None,
     )
+
+
+def remote_reference(
+    url: str = "https://images.example/cover.png",
+) -> ArtworkReference:
+    return ArtworkReference("test", url, url=url)
 
 
 def image_bytes(size: tuple[int, int] = (32, 32)) -> bytes:
@@ -84,7 +89,7 @@ def test_download_validates_and_stores_original_square_rgb_artwork(
     monkeypatch.setattr(artwork, "urlopen", fake_urlopen)
     cache = ArtworkCache(tmp_path, timeout=1.5)
 
-    path = cache.get(make_album())
+    path = cache.get(make_album(), remote_reference())
 
     assert path.parent == tmp_path / "artwork"
     assert path.suffix == ".png"
@@ -97,6 +102,7 @@ def test_download_validates_and_stores_original_square_rgb_artwork(
     metadata = loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["album_id"] == "album-1"
     assert metadata["content_type"] == "image/png"
+    assert metadata["artwork_origin"] == "https://images.example/cover.png"
     assert metadata["width"] == 32
     assert len(metadata["content_sha256"]) == 64
 
@@ -116,8 +122,9 @@ def test_valid_cached_artwork_is_never_redownloaded(
     monkeypatch.setattr(artwork, "urlopen", fake_urlopen)
     cache = ArtworkCache(tmp_path)
 
-    first = cache.get(make_album())
-    second = cache.get(make_album(album_name="Renamed"))
+    reference = remote_reference()
+    first = cache.get(make_album(), reference)
+    second = cache.get(make_album(album_name="Renamed"), reference)
 
     assert first == second
     assert calls == 1
@@ -148,7 +155,7 @@ def test_transient_download_failures_are_retried(
     monkeypatch.setattr(artwork, "urlopen", flaky_urlopen)
     cache = ArtworkCache(tmp_path, retries=2, retry_backoff=0)
 
-    assert cache.get(make_album()).is_file()
+    assert cache.get(make_album(), remote_reference()).is_file()
     assert attempts == 3
 
 
@@ -175,19 +182,17 @@ def test_malformed_artwork_is_rejected_without_cache_files(
     cache = ArtworkCache(tmp_path)
 
     with pytest.raises(ArtworkValidationError, match=message):
-        cache.get(make_album())
+        cache.get(make_album(), remote_reference())
 
     assert not list((tmp_path / "artwork").glob("*.png"))
     assert not list((tmp_path / "metadata").glob("*.json"))
 
 
-def test_missing_or_non_http_artwork_url_is_rejected(tmp_path: Path) -> None:
+def test_non_http_artwork_url_is_rejected(tmp_path: Path) -> None:
     cache = ArtworkCache(tmp_path)
 
-    with pytest.raises(ArtworkDownloadError, match="no artwork URL"):
-        cache.get(make_album(artwork_url=None))
     with pytest.raises(ArtworkDownloadError, match="HTTP or HTTPS"):
-        cache.get(make_album(artwork_url="file:///tmp/cover.png"))
+        cache.get(make_album(), remote_reference("file:///tmp/cover.png"))
 
 
 def test_get_many_deduplicates_albums_and_preserves_order(
@@ -199,15 +204,20 @@ def test_get_many_deduplicates_albums_and_preserves_order(
         "urlopen",
         lambda request, timeout: FakeResponse(image_bytes()),
     )
-    first = make_album("album-1", artwork_url="https://images.example/1.png")
-    duplicate = make_album("album-1", artwork_url="https://images.example/1.png")
-    second = make_album("album-2", artwork_url="https://images.example/2.png")
+    first = make_album("album-1")
+    duplicate = make_album("album-1")
+    second = make_album("album-2")
 
-    paths = ArtworkCache(tmp_path).get_many((first, duplicate, second))
+    paths = ArtworkCache(tmp_path).get_many(
+        (
+            (first, remote_reference("https://images.example/1.png")),
+            (duplicate, remote_reference("https://images.example/1.png")),
+            (second, remote_reference("https://images.example/2.png")),
+        )
+    )
 
     assert len(paths) == 2
-    assert paths[0].stem == ArtworkCache(tmp_path).cache_key(first)
-    assert paths[1].stem == ArtworkCache(tmp_path).cache_key(second)
+    assert paths[0] != paths[1]
 
 
 def test_concurrent_downloads_respect_worker_limit(
@@ -241,15 +251,15 @@ def test_concurrent_downloads_respect_worker_limit(
         "urlopen",
         lambda request, timeout: MeasuredResponse(image_bytes()),
     )
-    albums = tuple(
-        make_album(
-            f"album-{index}",
-            artwork_url=f"https://images.example/{index}.png",
+    references = tuple(
+        (
+            make_album(f"album-{index}"),
+            remote_reference(f"https://images.example/{index}.png"),
         )
         for index in range(8)
     )
 
-    paths = ArtworkCache(tmp_path, max_workers=3).get_many(albums)
+    paths = ArtworkCache(tmp_path, max_workers=3).get_many(references)
 
     assert len(paths) == 8
     assert 1 < maximum_active <= 3
@@ -272,7 +282,7 @@ def test_artwork_pixel_limit_rejects_decompression_risk(
     cache = ArtworkCache(tmp_path, max_artwork_pixels=100)
 
     with pytest.raises(ArtworkValidationError, match="exceeds 100 pixels"):
-        cache.get(make_album())
+        cache.get(make_album(), remote_reference())
 
 
 def test_artwork_limits_must_be_positive(tmp_path: Path) -> None:

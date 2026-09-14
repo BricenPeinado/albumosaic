@@ -7,6 +7,7 @@ import pytest
 
 from app.mosaic.grid import GridSpec
 from app.mosaic.matcher import MatchMode
+from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
 from app.ui.app import build_interface
 from app.ui.controller import (
@@ -14,6 +15,7 @@ from app.ui.controller import (
     blend_percentage_to_alpha,
     match_mode_from_unique,
 )
+from app.workflow import PreparedPlaylist
 
 
 def _playlist() -> Playlist:
@@ -23,7 +25,6 @@ def _playlist() -> Playlist:
             album_id=f"album-{index}",
             album_name=f"Album {index}",
             artists=("Artist",),
-            artwork_url=f"https://example.test/{index}.png",
             source_url=None,
         )
         tracks.append(
@@ -41,9 +42,14 @@ def _playlist() -> Playlist:
 class _FakeWorkflow:
     last_match_mode: MatchMode | None = None
 
-    def resolve_playlist(self, playlist_url: str) -> Playlist:
+    def prepare_playlist(self, playlist_url: str) -> PreparedPlaylist:
         assert playlist_url == "https://open.spotify.com/playlist/abc123"
-        return _playlist()
+        playlist = _playlist()
+        artwork = tuple(
+            ResolvedArtwork(album, Path(f"{index}.png"))
+            for index, album in enumerate(playlist.albums)
+        )
+        return PreparedPlaylist(playlist, artwork)
 
     def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
         assert str(video_path) == "video.mp4"
@@ -73,8 +79,11 @@ def test_playlist_resolution_enables_density_with_unique_album_maximum() -> None
     )
     final = updates[-1]
 
-    assert final[0].unique_album_count == 3
-    assert final[1] == "Found **3 tracks** across **3 unique albums**."
+    assert final[0].playlist.unique_album_count == 3
+    assert final[1] == (
+        "Found **3 tracks** across **3 unique albums**.  \n"
+        "Independent artwork found for **3 albums**."
+    )
     assert final[2]["maximum"] == 3
     assert final[2]["interactive"] is True
     assert final[3] == "Mosaic grid: approximately **2 × 2** (4 tiles)"

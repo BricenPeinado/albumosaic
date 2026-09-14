@@ -19,3 +19,9 @@ their respective owners.
 
 Spotify is a trademark of Spotify AB. Albumosaic is an independent project and
 is not affiliated with, endorsed by, or sponsored by Spotify.
+
+Spotify Web API data is used only for playlist, track, and album metadata.
+Spotify-hosted artwork is not downloaded or transformed by Albumosaic.
+Independent artwork metadata is provided by MusicBrainz, and available covers
+are retrieved from the Cover Art Archive operated with the Internet Archive.
+Those services and user-provided images retain their own terms and rights.

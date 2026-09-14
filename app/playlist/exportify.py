@@ -16,7 +16,6 @@ _COLUMN_ALIASES = {
     "album_uri": ("Album URI", "Album URL"),
     "album_name": ("Album Name", "Album"),
     "album_artists": ("Album Artist Name(s)", "Album Artists"),
-    "artwork_url": ("Album Image URL", "Artwork URL"),
     "release_date": ("Album Release Date", "Release Date"),
     "disc_number": ("Disc Number",),
     "track_number": ("Track Number",),
@@ -129,7 +128,6 @@ def _parse_track(
         album_id=_source_id(album_uri, "album"),
         album_name=album_name,
         artists=album_artists,
-        artwork_url=_value(row, columns, "artwork_url"),
         source_url=_source_url(album_uri, "album"),
         release_date=_value(row, columns, "release_date"),
     )

@@ -14,7 +14,6 @@ class Album:
     album_id: str | None
     album_name: str
     artists: tuple[str, ...]
-    artwork_url: str | None
     source_url: str | None
     release_date: str | None = None
 

@@ -1,6 +1,6 @@
 """Gradio event adapters for the provider-neutral Albumosaic workflow."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -10,7 +10,7 @@ import gradio as gr
 
 from app.mosaic.matcher import MatchMode
 from app.playlist.models import Playlist
-from app.workflow import AlbumosaicWorkflow, WorkflowProgress
+from app.workflow import AlbumosaicWorkflow, PreparedPlaylist, WorkflowProgress
 
 
 class AlbumosaicUIController:
@@ -27,9 +27,40 @@ class AlbumosaicUIController:
         unique_per_frame: bool,
     ) -> Iterator[tuple[Any, ...]]:
         """Resolve playlist input and enable density-dependent controls."""
+        yield from self._resolve_prepared(
+            lambda: self.workflow.prepare_playlist(playlist_url),
+            video_path,
+            tile_count,
+            unique_per_frame,
+        )
+
+    def resolve_exportify(
+        self,
+        csv_path: str | None,
+        video_path: str | None,
+        tile_count: int,
+        unique_per_frame: bool,
+    ) -> Iterator[tuple[Any, ...]]:
+        """Resolve Exportify metadata through the independent art provider."""
+        if not csv_path:
+            return
+        yield from self._resolve_prepared(
+            lambda: self.workflow.prepare_exportify(csv_path),
+            video_path,
+            tile_count,
+            unique_per_frame,
+        )
+
+    def _resolve_prepared(
+        self,
+        prepare: Callable[[], PreparedPlaylist],
+        video_path: str | None,
+        tile_count: int,
+        unique_per_frame: bool,
+    ) -> Iterator[tuple[Any, ...]]:
         yield (
             None,
-            "Resolving playlist…",
+            "Resolving playlist and independent artwork…",
             gr.update(minimum=2, maximum=3, value=2, interactive=False),
             "Mosaic grid: add a video after resolving your playlist.",
             gr.update(interactive=False),
@@ -39,30 +70,31 @@ class AlbumosaicUIController:
         )
 
         try:
-            playlist = self.workflow.resolve_playlist(playlist_url)
+            prepared = prepare()
+            playlist = prepared.playlist
             album_count = playlist.unique_album_count
-            if album_count < 2:
-                raise ValueError("The playlist must contain at least 2 unique albums")
-            selected_count = min(max(2, tile_count), album_count)
+            usable_count = prepared.usable_album_count
+            selected_count = min(max(2, tile_count), max(2, album_count))
             yield (
-                playlist,
+                prepared,
                 (
                     f"Found **{len(playlist.tracks)} tracks** across "
-                    f"**{album_count} unique albums**."
+                    f"**{album_count} unique albums**.  \nIndependent artwork "
+                    f"found for **{usable_count} albums**."
                 ),
                 gr.update(
                     minimum=2,
-                    maximum=album_count,
+                    maximum=max(2, album_count),
                     value=selected_count,
-                    interactive=True,
+                    interactive=usable_count >= 2,
                 ),
                 self.grid_text(
                     video_path,
                     selected_count,
-                    playlist,
+                    prepared,
                     unique_per_frame,
                 ),
-                gr.update(interactive=bool(video_path)),
+                gr.update(interactive=bool(video_path) and usable_count >= 2),
                 "Playlist ready",
                 0,
                 "Frames processed: —",
@@ -79,15 +111,24 @@ class AlbumosaicUIController:
                 "Frames processed: —",
             )
 
+    def connect_spotify(self) -> str:
+        """Run configured OAuth without exposing token details to Gradio."""
+        try:
+            return self.workflow.connect_playlist_source()
+        except Exception as error:
+            return f"Spotify connection failed: {error}"
+
     def update_readiness(
         self,
         video_path: str | None,
         tile_count: int,
-        playlist: Playlist | None,
+        playlist: Playlist | PreparedPlaylist | None,
         unique_per_frame: bool,
     ) -> tuple[str, dict[str, Any]]:
         """Refresh the grid estimate and Generate button state."""
         ready = playlist is not None and bool(video_path)
+        if isinstance(playlist, PreparedPlaylist):
+            ready = ready and playlist.usable_album_count >= 2
         return (
             self.grid_text(video_path, tile_count, playlist, unique_per_frame),
             gr.update(interactive=ready),
@@ -97,7 +138,7 @@ class AlbumosaicUIController:
         self,
         video_path: str | None,
         tile_count: int,
-        playlist: Playlist | None = None,
+        playlist: Playlist | PreparedPlaylist | None = None,
         unique_per_frame: bool = False,
     ) -> str:
         """Return a concise aspect-aware grid summary."""
@@ -111,22 +152,25 @@ class AlbumosaicUIController:
             f"Mosaic grid: approximately **{grid.columns} × {grid.rows}** "
             f"({grid.tile_count} tiles)"
         )
+        metadata = (
+            playlist.playlist if isinstance(playlist, PreparedPlaylist) else playlist
+        )
         if (
             unique_per_frame
-            and playlist is not None
-            and grid.tile_count > playlist.unique_album_count
+            and metadata is not None
+            and grid.tile_count > metadata.unique_album_count
         ):
-            repeats = grid.tile_count - playlist.unique_album_count
+            repeats = grid.tile_count - metadata.unique_album_count
             repeat_label = "repeat" if repeats == 1 else "repeats"
             summary += (
-                f"  \n{playlist.unique_album_count} unique albums available — "
+                f"  \n{metadata.unique_album_count} unique albums available — "
                 f"up to {repeats} {repeat_label} may be required."
             )
         return summary
 
     def generate(
         self,
-        playlist: Playlist | None,
+        playlist: Playlist | PreparedPlaylist | None,
         video_path: str | None,
         tile_count: int,
         blend_percentage: float,

@@ -31,7 +31,8 @@ THEME = gr.themes.Base(primary_hue="orange", neutral_hue="zinc")
 
 def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
     """Build the Albumosaic interface without launching it."""
-    controller = AlbumosaicUIController(workflow or AlbumosaicWorkflow())
+    active_workflow = workflow or AlbumosaicWorkflow()
+    controller = AlbumosaicUIController(active_workflow)
 
     with gr.Blocks(title="Albumosaic") as interface:
         playlist_state = gr.State(value=None)
@@ -44,6 +45,8 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
             )
 
             with gr.Group(elem_classes="albumosaic-card"):
+                connect_spotify = gr.Button("Connect Spotify")
+                spotify_status = gr.Markdown(active_workflow.playlist_connection_status)
                 playlist_url = gr.Textbox(
                     label="Spotify playlist",
                     placeholder="https://open.spotify.com/playlist/…",
@@ -52,6 +55,11 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
                 playlist_summary = gr.Markdown(
                     "Paste a Spotify playlist URL to begin.",
                     elem_classes="albumosaic-summary",
+                )
+                exportify_csv = gr.File(
+                    label="Or use an Exportify CSV",
+                    file_types=[".csv"],
+                    type="filepath",
                 )
 
                 source_video = gr.Video(
@@ -141,6 +149,15 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
             fn=controller.resolve_playlist,
             inputs=[playlist_url, source_video, density, unique_per_frame],
             outputs=resolution_outputs,
+        )
+        exportify_csv.change(
+            fn=controller.resolve_exportify,
+            inputs=[exportify_csv, source_video, density, unique_per_frame],
+            outputs=resolution_outputs,
+        )
+        connect_spotify.click(
+            fn=controller.connect_spotify,
+            outputs=spotify_status,
         )
         source_video.change(
             fn=controller.update_readiness,

@@ -5,19 +5,20 @@ photomosaic whose tiles are album covers from a Spotify playlist.
 
 This repository contains a Gradio application, a still-image mosaic renderer,
 frame-by-frame video rendering with FFmpeg audio restoration, provider-neutral
-playlist ingestion, and a validated artwork cache. Local Exportify CSV
-ingestion is available. Direct Spotify ingestion is intentionally not yet
-configured and the application does not scrape Spotify pages.
+playlist ingestion, and a validated artwork cache. Spotify OAuth retrieves
+playlist metadata only; mosaic artwork comes from user files or the independent
+MusicBrainz/Cover Art Archive services. Local Exportify CSV ingestion remains
+available.
 
 > **Project status:** Albumosaic is pre-release software. Still-image and video
 > rendering, Exportify CSV ingestion, caching, and the Gradio workflow are
-> implemented. The default UI validates Spotify playlist URLs but cannot fetch
-> their contents until a live `PlaylistSource` provider is configured.
+> implemented. Live Spotify metadata requires a developer Client ID and only
+> works for playlists the authenticated user owns or collaborates on.
 
 ## Intended pipeline
 
-1. Accept a public Spotify playlist URL and a source video.
-2. Resolve the playlist's unique albums and cache their cover artwork.
+1. Accept an owned/collaborative Spotify playlist URL or Exportify CSV.
+2. Resolve track and album identity, then independently locate permitted art.
 3. Decode the source video frame by frame with OpenCV.
 4. Divide each frame into a grid and match each region to an album cover using
    NumPy-based color comparisons.
@@ -39,7 +40,9 @@ albumosaic/
 │   ├── playlist/
 │   │   ├── source.py        # Provider-neutral ingestion interface
 │   │   ├── exportify.py     # Local Exportify CSV source
-│   │   ├── spotify.py       # Pure Spotify playlist URL validation
+│   │   ├── spotify.py       # Spotify metadata-only playlist source
+│   │   ├── spotify_auth.py  # In-memory OAuth PKCE authentication
+│   │   ├── artwork_sources.py # Independent artwork strategies
 │   │   ├── parser.py        # Provider-neutral ingestion entry point
 │   │   ├── models.py        # Playlist and album domain models
 │   │   └── artwork.py       # Artwork download and cache management
@@ -86,22 +89,77 @@ playlist = resolve_playlist("my-playlist.csv")
 print(playlist.unique_album_count)
 ```
 
-The parser reads track and album URIs, names, artists, artwork URLs, release
+The parser reads track and album URIs, names, artists, release
 dates, track numbering and duration, preview URLs, explicit/popularity fields,
 ISRC, and added metadata when those columns are present. It makes no Spotify
 requests.
 
 Spotify playlist URLs can be validated independently with
 `parse_spotify_playlist_url(...)`. This extracts a base-62 playlist ID and
-returns a canonical `SpotifyPlaylistReference`; it does not fetch or scrape the
-URL.
+returns a canonical `SpotifyPlaylistReference`; no Spotify HTML is scraped.
+
+## Spotify setup
+
+Albumosaic uses Authorization Code with PKCE, so no client secret is needed and
+tokens remain only in memory.
+
+1. Go to [Spotify for Developers](https://developer.spotify.com/dashboard).
+2. Create an application.
+3. Add this exact redirect URI: `http://127.0.0.1:8888/spotify/callback`.
+4. Copy the application's Client ID.
+5. Configure the environment variables below.
+6. Launch Albumosaic and click **Connect Spotify**.
+7. Authorize in the opened browser, then paste a playlist you own or collaborate
+   on.
+
+```bash
+export SPOTIFY_CLIENT_ID="your-client-id"
+export SPOTIFY_REDIRECT_URI="http://127.0.0.1:8888/spotify/callback"
+export MUSICBRAINZ_CONTACT="you@example.com"
+```
+
+Spotify Development Mode currently permits playlist-item access only when the
+authenticated user owns the playlist or is a collaborator. Arbitrary public
+playlists are not supported. Use the Exportify CSV input when Spotify cannot
+provide the metadata.
+
+Spotify is used only for playlist, track, and album identity metadata.
+Spotify-hosted artwork URLs are discarded even when present in API or Exportify
+responses; they are never downloaded, cached, transformed, or rendered.
 
 ## Artwork cache
 
-`ArtworkCache` accepts unique `Album` objects and returns local artwork paths.
-It uses stable album-identity keys, validates HTTP responses and image content,
-stores original-resolution square artwork as RGB PNG, and writes JSON metadata
-atomically. Valid cached images are reused without another request.
+Artwork resolution prioritizes an optional user-owned local manifest, then
+MusicBrainz release-group search and Cover Art Archive. Low-confidence or
+ambiguous MusicBrainz matches are skipped. Missing artwork does not fail the
+playlist, but at least two usable covers are required to render.
+
+Set `ALBUMOSAIC_ARTWORK_MANIFEST` to a JSON file for local-first artwork:
+
+```json
+[
+  {
+    "artist": "Neutral Milk Hotel",
+    "album": "In the Aeroplane Over the Sea",
+    "path": "covers/in-the-aeroplane.jpg"
+  }
+]
+```
+
+Relative paths are resolved from the manifest directory. `ArtworkCache` uses
+stable album-identity keys, validates HTTP responses and images, stores square
+RGB PNG files, and writes metadata atomically. Valid files are reused.
+
+MusicBrainz requests use a contact-bearing User-Agent and are serialized to at
+most one request per second. Album identity mappings are cached. Network access
+is restricted to these service hosts:
+
+- `accounts.spotify.com` for OAuth
+- `api.spotify.com` for playlist metadata
+- `musicbrainz.org` for independent release-group search
+- `coverartarchive.org` and redirects beneath `archive.org` for cover files
+
+Spotify artwork hosts such as `i.scdn.co` are explicitly rejected by the cache.
 
 Downloads use configurable timeouts and retries, a 20 MB response limit, and a
 bounded thread pool with four workers by default. Playlist parsing remains
@@ -144,9 +202,8 @@ through an injected `PlaylistSource`, updates density from the unique-album
 count, previews the calculated grid, streams all six generation stages, and
 exposes the completed MP4 for preview and download.
 
-The default source validates Spotify playlist URLs but deliberately stops
-before making a network request. Configure a live `PlaylistSource` when direct
-Spotify access is added; the workflow and UI do not require changes.
+When `SPOTIFY_CLIENT_ID` is absent, the app starts normally and explains the
+missing setup. Exportify and local artwork remain available.
 
 Install development tools and run the same release gates as CI with:
 
@@ -264,7 +321,8 @@ comparison and prints the same five timing categories for both implementations.
 
 ## User interface
 
-The UI includes a Spotify playlist field, drag-and-drop video upload,
+The UI includes Spotify connection status, Spotify URL and Exportify CSV inputs,
+drag-and-drop video upload,
 playlist-driven mosaic density, an aspect-aware grid estimate, a Generate
 control, six-stage progress with percentage and frame counts, and MP4 preview
 and download outputs.

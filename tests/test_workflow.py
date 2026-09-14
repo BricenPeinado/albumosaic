@@ -2,16 +2,21 @@
 
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from app.mosaic.matcher import MatchMode
+from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
 from app.playlist.source import PlaylistInput, PlaylistSource
+from app.playlist.spotify import SpotifyPlaylistSource
 from app.workflow import (
     AlbumosaicWorkflow,
     SpotifyPlaylistResolutionUnavailable,
+    UnconfiguredSpotifyPlaylistSource,
     WorkflowProgress,
     WorkflowStage,
+    default_spotify_playlist_source,
 )
 
 
@@ -22,7 +27,6 @@ def _playlist() -> Playlist:
             album_id=f"album-{index}",
             album_name=f"Album {index}",
             artists=("Artist",),
-            artwork_url=f"https://example.test/{index}.png",
             source_url=None,
         )
         tracks.append(
@@ -50,9 +54,12 @@ class _ArtworkProvider:
     def __init__(self, paths: tuple[Path, ...]) -> None:
         self.paths = paths
 
-    def get_many(self, albums: tuple[Album, ...]) -> tuple[Path, ...]:
+    def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
         assert len(albums) == len(self.paths)
-        return self.paths
+        return tuple(
+            ResolvedArtwork(album, path)
+            for album, path in zip(albums, self.paths, strict=True)
+        )
 
 
 def test_default_source_validates_but_does_not_contact_spotify() -> None:
@@ -125,3 +132,57 @@ def test_generate_reports_all_stages_and_frame_progress(tmp_path: Path) -> None:
         (4, 4),
     ]
     assert progress[-1] == WorkflowProgress(WorkflowStage.FINISHED, 100)
+
+
+def test_default_source_uses_spotify_only_when_configured(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    assert isinstance(
+        default_spotify_playlist_source(), UnconfiguredSpotifyPlaylistSource
+    )
+
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "client-id")
+    assert isinstance(default_spotify_playlist_source(), SpotifyPlaylistSource)
+
+
+def test_generation_requires_two_independently_resolved_albums(
+    tmp_path: Path,
+) -> None:
+    playlist = _playlist()
+    cover = tmp_path / "one.png"
+    Image.new("RGB", (12, 12), "red").save(cover)
+
+    class PartialProvider:
+        def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+            return (ResolvedArtwork(albums[0], cover),)
+
+    workflow = AlbumosaicWorkflow(
+        playlist_source=_PlaylistSource(playlist),
+        artwork_provider=PartialProvider(),
+        output_dir=tmp_path / "output",
+    )
+
+    with pytest.raises(ValueError, match="At least two albums"):
+        workflow.generate(playlist, "unused.mp4", 2)
+
+
+def test_exportify_uses_the_same_independent_artwork_provider(tmp_path: Path) -> None:
+    csv_path = tmp_path / "playlist.csv"
+    csv_path.write_text(
+        "Track Name,Artist Name(s),Album Name,Album Image URL\n"
+        "Song,Artist,Album,https://i.scdn.co/ignored.jpg\n",
+        encoding="utf-8",
+    )
+    observed: list[tuple[Album, ...]] = []
+
+    class RecordingProvider:
+        def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+            observed.append(albums)
+            return ()
+
+    workflow = AlbumosaicWorkflow(artwork_provider=RecordingProvider())
+    prepared = workflow.prepare_exportify(csv_path)
+
+    assert prepared.usable_album_count == 0
+    assert observed[0][0].album_name == "Album"
