@@ -1,11 +1,21 @@
-"""Spotify playlist ingestion boundary."""
+"""Provider-neutral playlist ingestion entry point."""
 
+from app.playlist.exportify import ExportifyCSVSource
 from app.playlist.models import Playlist
+from app.playlist.source import PlaylistInput, PlaylistSource
+from app.playlist.spotify import SpotifyPlaylistReference, parse_spotify_playlist_url
+
+__all__ = [
+    "SpotifyPlaylistReference",
+    "parse_spotify_playlist_url",
+    "resolve_playlist",
+]
 
 
-def ingest_playlist(playlist_url: str) -> Playlist:
-    """Load playlist metadata and its unique albums from Spotify.
-
-    Authentication and Spotify API integration will be added in a later stage.
-    """
-    raise NotImplementedError("Spotify playlist ingestion is not implemented yet")
+def resolve_playlist(
+    playlist_input: PlaylistInput,
+    source: PlaylistSource | None = None,
+) -> Playlist:
+    """Resolve input through the selected source, defaulting to Exportify CSV."""
+    playlist_source = source if source is not None else ExportifyCSVSource()
+    return playlist_source.resolve_playlist(playlist_input)

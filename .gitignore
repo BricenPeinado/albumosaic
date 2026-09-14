@@ -6,7 +6,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+build/
+dist/
 
 # Virtual environments and local configuration
 .venv/
@@ -14,14 +18,36 @@ venv/
 .env
 .env.*
 !.env.example
+*.log
 
 # Editors and operating systems
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
 
 # Generated and downloaded media
 cache/*
 !cache/.gitkeep
+!cache/artwork/
+cache/artwork/*
+!cache/artwork/.gitkeep
+!cache/metadata/
+cache/metadata/*
+!cache/metadata/.gitkeep
 output/*
 !output/.gitkeep
+
+# User uploads, generated videos, and playlist exports
+uploads/
+user_uploads/
+flagged/
+gradio_cached_examples/
+*.avi
+*.m4v
+*.mkv
+*.mov
+*.mp4
+*.webm
+*.csv
+*.tsv

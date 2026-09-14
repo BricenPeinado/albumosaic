@@ -1,1 +1,1 @@
-"""Spotify playlist and album-artwork services."""
+"""Provider-neutral playlist and album-artwork services."""
