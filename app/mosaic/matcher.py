@@ -2,12 +2,14 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from threading import RLock
 from weakref import ReferenceType, ref
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageOps
+from scipy.optimize import linear_sum_assignment
 
 from app.mosaic.grid import GridSpec
 
@@ -30,6 +32,13 @@ _SRGB_TO_LINEAR_LUT = np.where(
     _SRGB_VALUES / 12.92,
     ((_SRGB_VALUES + 0.055) / 1.055) ** 2.4,
 ).astype(np.float32)
+
+
+class MatchMode(StrEnum):
+    """Available album-to-cell matching strategies."""
+
+    NEAREST = "nearest"
+    UNIQUE_PER_FRAME = "unique_per_frame"
 
 
 @dataclass(slots=True)
@@ -172,6 +181,34 @@ class AlbumLabIndex:
             album_squared_norms=self.squared_norms,
         )
 
+    def unique(self, target_means: ColorArray) -> NDArray[np.intp]:
+        """Globally match albums uniquely, repeating only overflow cells."""
+        costs = squared_color_distances(
+            target_means,
+            self.vectors,
+            album_squared_norms=self.squared_norms,
+        )
+        cell_indices, album_indices = linear_sum_assignment(costs)
+        matches = np.full(len(target_means), -1, dtype=np.intp)
+        matches[cell_indices] = album_indices
+
+        overflow = matches < 0
+        if np.any(overflow):
+            matches[overflow] = np.argmin(costs[overflow], axis=1)
+        return matches
+
+    def match(
+        self,
+        target_means: ColorArray,
+        mode: MatchMode = MatchMode.NEAREST,
+    ) -> NDArray[np.intp]:
+        """Match target cells using the selected deterministic strategy."""
+        if not isinstance(mode, MatchMode):
+            raise TypeError("mode must be a MatchMode")
+        if mode is MatchMode.NEAREST:
+            return self.nearest(target_means)
+        return self.unique(target_means)
+
 
 def rgb_to_lab(rgb: RgbArray) -> ColorArray:
     """Convert an RGB uint8 array to CIE L*a*b* using a D65 white point."""
@@ -241,6 +278,21 @@ def nearest_color_indices(
     album_squared_norms: ColorArray | None = None,
 ) -> NDArray[np.intp]:
     """Match all cells at once using squared Euclidean matrix distances."""
+    distances = squared_color_distances(
+        target_means,
+        album_means,
+        album_squared_norms=album_squared_norms,
+    )
+    return np.asarray(np.argmin(distances, axis=1), dtype=np.intp)
+
+
+def squared_color_distances(
+    target_means: ColorArray,
+    album_means: ColorArray,
+    *,
+    album_squared_norms: ColorArray | None = None,
+) -> ColorArray:
+    """Return the vectorized squared LAB distance for every cell/album pair."""
     if target_means.ndim != 2 or target_means.shape[1] != 3:
         raise ValueError("Target means must have shape (cell_count, 3)")
     if album_means.ndim != 2 or album_means.shape[1] != 3 or not len(album_means):
@@ -255,25 +307,27 @@ def nearest_color_indices(
     elif album_squared_norms.shape != (len(album_means),):
         raise ValueError("Album squared norms must match the album count")
 
-    distances = (
+    distances = np.asarray(
         np.sum(target_means * target_means, axis=1)[:, None]
         + album_squared_norms[None, :]
-        - (2 * target_means @ album_means.T)
+        - (2 * target_means @ album_means.T),
+        dtype=np.float32,
     )
-    return np.asarray(np.argmin(distances, axis=1), dtype=np.intp)
+    return np.maximum(distances, 0.0, out=distances)
 
 
 def match_artwork(
     target_image: Image.Image,
     album_tiles: Sequence[AlbumTile],
     grid: GridSpec,
+    mode: MatchMode = MatchMode.NEAREST,
 ) -> NDArray[np.intp]:
     """Match target-cell LAB means to cached album LAB means."""
     if not album_tiles:
         raise ValueError("At least one album tile is required")
 
     target_means = calculate_cell_lab_means(target_image, grid)
-    return AlbumLabIndex.from_tiles(album_tiles).nearest(target_means)
+    return AlbumLabIndex.from_tiles(album_tiles).match(target_means, mode)
 
 
 def match_artwork_rgb(

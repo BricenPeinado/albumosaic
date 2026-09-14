@@ -10,7 +10,7 @@ from uuid import uuid4
 from PIL import Image
 
 from app.mosaic.grid import GridSpec, calculate_grid
-from app.mosaic.matcher import AlbumTile
+from app.mosaic.matcher import AlbumTile, MatchMode
 from app.mosaic.renderer import validate_blend_alpha
 from app.playlist.artwork import ArtworkCache
 from app.playlist.models import Album, Playlist
@@ -114,9 +114,12 @@ class AlbumosaicWorkflow:
         progress_reporter: ProgressReporter | None = None,
         *,
         blend_alpha: float = 0.0,
+        match_mode: MatchMode = MatchMode.NEAREST,
     ) -> Path:
         """Generate a mosaic MP4 while reporting provider-neutral stages."""
         alpha = validate_blend_alpha(blend_alpha)
+        if not isinstance(match_mode, MatchMode):
+            raise TypeError("match_mode must be a MatchMode")
         if playlist.unique_album_count < 2:
             raise ValueError("A playlist needs at least two unique albums")
         if not 2 <= tile_count <= playlist.unique_album_count:
@@ -157,6 +160,7 @@ class AlbumosaicWorkflow:
                 progress_callback=report_frames,
                 finalizing_callback=report_finalizing,
                 blend_alpha=alpha,
+                match_mode=match_mode,
             )
         except Exception:
             destination.unlink(missing_ok=True)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from app.mosaic.matcher import MatchMode
 from app.playlist.models import Album, Playlist, Track
 from app.playlist.source import PlaylistInput, PlaylistSource
 from app.workflow import (
@@ -80,11 +81,13 @@ def test_generate_reports_all_stages_and_frame_progress(tmp_path: Path) -> None:
         progress_callback,
         finalizing_callback,
         blend_alpha: float,
+        match_mode: MatchMode,
     ) -> Path:
         assert input_path == "input.mp4"
         assert len(album_tiles) == 2
         assert tile_count == 2
         assert blend_alpha == 0.15
+        assert match_mode is MatchMode.UNIQUE_PER_FRAME
         progress_callback(0, 4)
         progress_callback(2, 4)
         progress_callback(4, 4)
@@ -107,6 +110,7 @@ def test_generate_reports_all_stages_and_frame_progress(tmp_path: Path) -> None:
         2,
         progress.append,
         blend_alpha=0.15,
+        match_mode=MatchMode.UNIQUE_PER_FRAME,
     )
 
     assert result.read_bytes() == b"mp4"

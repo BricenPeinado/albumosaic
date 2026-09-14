@@ -171,10 +171,18 @@ cell count to preserve the target image's aspect ratio.
 
 ## Matcher benchmark
 
-Run the deterministic RGB-baseline versus CIELAB benchmark with:
+Run the deterministic RGB-baseline, nearest-CIELAB, and unique-assignment
+benchmark with:
 
 ```bash
 python -m benchmarks.benchmark_matcher
+```
+
+Representative assignment workloads can be measured with:
+
+```bash
+python -m benchmarks.benchmark_matcher --tiles 48 --albums 100
+python -m benchmarks.benchmark_matcher --tiles 100 --albums 200
 ```
 
 The benchmark reports the one-time cached album-feature cost separately from
@@ -230,6 +238,20 @@ The value ranges from `0.0` to `1.0`; the UI exposes the intentionally narrower
 The original frame is never blended before target analysis, so changing this
 setting does not affect which album cover is selected for any cell. The default
 is 0%, preserving existing output.
+
+### Album repetition within a frame
+
+Normal matching selects the nearest LAB-color album independently for every
+cell. This gives the best color accuracy, but the same cover may appear many
+times. Enable **Don't repeat albums in the same frame** to use a global
+color-cost assignment that normally uses each album at most once per frame.
+This increases album variety and can slightly reduce color accuracy.
+
+For example, four independently matched cells might select `A, A, B, A`; the
+unique mode can instead select `A, C, B, D`. The constraint resets for each
+frame, so an album may appear again in the next frame. When the calculated grid
+contains more cells than the playlist has albums, every album is used once and
+only the minimum necessary overflow cells are allowed to repeat covers.
 
 To reproduce the before/after profile on deterministic synthetic video data:
 

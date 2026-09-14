@@ -9,7 +9,7 @@ from time import perf_counter
 
 from PIL import Image
 
-from app.mosaic.matcher import AlbumTile, AlbumTileCache
+from app.mosaic.matcher import AlbumTile, AlbumTileCache, MatchMode
 from app.mosaic.renderer import MosaicRenderPlan, validate_blend_alpha
 from app.video.audio import ensure_ffmpeg_available, finalize_h264_mp4
 from app.video.errors import UnsupportedCodecError
@@ -90,6 +90,7 @@ def render_video(
     finalizing_callback: FinalizingCallback | None = None,
     timing_callback: TimingCallback | None = None,
     blend_alpha: float = 0.0,
+    match_mode: MatchMode = MatchMode.NEAREST,
 ) -> Path:
     """Stream an input video into an audio-preserving H.264 mosaic MP4.
 
@@ -106,6 +107,8 @@ def render_video(
     if not album_tiles:
         raise ValueError("At least one album tile is required")
     alpha = validate_blend_alpha(blend_alpha)
+    if not isinstance(match_mode, MatchMode):
+        raise TypeError("match_mode must be a MatchMode")
     if destination_path.suffix.lower() != ".mp4":
         raise UnsupportedCodecError("Final video output must use the .mp4 extension")
 
@@ -124,6 +127,7 @@ def render_video(
                 metadata.height,
                 prepared_tiles,
                 tile_count,
+                match_mode,
             )
             if progress_callback is not None:
                 progress_callback(0, metadata.frame_count)

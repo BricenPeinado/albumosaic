@@ -69,6 +69,15 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
                     info="Number of album-cover tiles visible in each frame.",
                     interactive=False,
                 )
+                unique_per_frame = gr.Checkbox(
+                    value=False,
+                    label="Don't repeat albums in the same frame",
+                    info=(
+                        "Try to use every album only once per frame. This can "
+                        "increase variety but may make the mosaic slightly less "
+                        "color-accurate."
+                    ),
+                )
                 grid_summary = gr.Markdown(
                     "Mosaic grid: resolve a playlist and add a video.",
                     elem_classes="albumosaic-grid",
@@ -130,17 +139,22 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
         ]
         playlist_url.change(
             fn=controller.resolve_playlist,
-            inputs=[playlist_url, source_video, density],
+            inputs=[playlist_url, source_video, density, unique_per_frame],
             outputs=resolution_outputs,
         )
         source_video.change(
             fn=controller.update_readiness,
-            inputs=[source_video, density, playlist_state],
+            inputs=[source_video, density, playlist_state, unique_per_frame],
             outputs=[grid_summary, generate],
         )
         density.change(
             fn=controller.update_readiness,
-            inputs=[source_video, density, playlist_state],
+            inputs=[source_video, density, playlist_state, unique_per_frame],
+            outputs=[grid_summary, generate],
+        )
+        unique_per_frame.change(
+            fn=controller.update_readiness,
+            inputs=[source_video, density, playlist_state, unique_per_frame],
             outputs=[grid_summary, generate],
         )
         original_blend.change(
@@ -150,7 +164,13 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
         )
         generate.click(
             fn=controller.generate,
-            inputs=[playlist_state, source_video, density, original_blend],
+            inputs=[
+                playlist_state,
+                source_video,
+                density,
+                original_blend,
+                unique_per_frame,
+            ],
             outputs=[stage, percentage, frames, result_video, download, generate],
         )
 

@@ -10,6 +10,7 @@ from PIL import Image
 
 from app.mosaic.grid import calculate_grid
 from app.mosaic.matcher import (
+    AlbumLabIndex,
     AlbumTileCache,
     match_artwork,
     match_artwork_rgb,
@@ -22,7 +23,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--albums", type=int, default=200)
-    parser.add_argument("--tiles", type=int, default=512)
+    parser.add_argument("--tiles", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
     return parser.parse_args()
 
@@ -69,6 +70,22 @@ def main() -> None:
         lambda: match_artwork(target, album_tiles, grid),
         args.repeats,
     )
+    target_means = np.column_stack(
+        (
+            rng.uniform(0, 100, args.tiles),
+            rng.uniform(-128, 128, args.tiles),
+            rng.uniform(-128, 128, args.tiles),
+        )
+    ).astype(np.float32)
+    album_index = AlbumLabIndex.from_tiles(album_tiles)
+    nearest_time = timed_median(
+        lambda: album_index.nearest(target_means),
+        args.repeats,
+    )
+    unique_time = timed_median(
+        lambda: album_index.unique(target_means),
+        args.repeats,
+    )
     rgb_matches = match_artwork_rgb(target, album_tiles, grid)
     lab_matches = match_artwork(target, album_tiles, grid)
     agreement = float(np.mean(rgb_matches == lab_matches))
@@ -82,6 +99,10 @@ def main() -> None:
     print(f"CIELAB matcher median: {lab_time * 1000:.2f} ms")
     print(f"CIELAB/RGB runtime ratio: {lab_time / rgb_time:.2f}x")
     print(f"same selected album: {agreement:.1%} of cells")
+    print(f"assignment workload: {args.tiles} cells, {args.albums} albums")
+    print(f"warm nearest assignment median: {nearest_time * 1000:.3f} ms")
+    print(f"warm unique assignment median: {unique_time * 1000:.3f} ms")
+    print(f"unique/nearest assignment ratio: {unique_time / nearest_time:.2f}x")
 
 
 if __name__ == "__main__":

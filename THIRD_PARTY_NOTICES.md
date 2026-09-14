@@ -7,6 +7,7 @@ license terms apply:
 - [NumPy](https://github.com/numpy/numpy) — BSD and bundled component licenses
 - [OpenCV](https://github.com/opencv/opencv) — Apache License 2.0
 - [Pillow](https://github.com/python-pillow/Pillow) — HPND-style license
+- [SciPy](https://github.com/scipy/scipy) — BSD license
 - [FFmpeg](https://ffmpeg.org/legal.html) — LGPL or GPL depending on the build
 
 Pytest, pytest-cov, Ruff, and mypy are development-only tools and are not

@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import app.video.renderer as video_renderer_module
+from app.mosaic.matcher import MatchMode
+from app.mosaic.renderer import MosaicRenderPlan
 from app.video import audio
 from app.video.audio import audio_codec_name, has_audio_stream, video_codec_name
 from app.video.errors import CorruptVideoError, UnsupportedCodecError, VideoWriteError
@@ -149,6 +152,42 @@ def test_render_video_preserves_existing_audio(tmp_path: Path) -> None:
     assert has_audio_stream(output_path) is True
     assert audio_codec_name(output_path) == "aac"
     assert video_codec_name(output_path) == "h264"
+
+
+def test_render_video_passes_match_mode_into_render_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.avi"
+    output_path = tmp_path / "mosaic.mp4"
+    create_test_video(input_path, frame_count=1)
+    observed_modes: list[MatchMode] = []
+    real_plan = MosaicRenderPlan
+
+    def recording_plan(
+        width: int,
+        height: int,
+        album_tiles: tuple,
+        tile_count: int,
+        match_mode: MatchMode,
+    ) -> MosaicRenderPlan:
+        observed_modes.append(match_mode)
+        return real_plan(width, height, album_tiles, tile_count, match_mode)
+
+    monkeypatch.setattr(video_renderer_module, "MosaicRenderPlan", recording_plan)
+
+    render_video(
+        input_path,
+        [
+            Image.new("RGB", (20, 20), "black"),
+            Image.new("RGB", (20, 20), "white"),
+        ],
+        tile_count=2,
+        output_path=output_path,
+        match_mode=MatchMode.UNIQUE_PER_FRAME,
+    )
+
+    assert observed_modes == [MatchMode.UNIQUE_PER_FRAME]
 
 
 def test_reader_rejects_corrupt_video(tmp_path: Path) -> None:

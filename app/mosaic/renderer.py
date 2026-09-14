@@ -13,6 +13,7 @@ from app.mosaic.matcher import (
     AlbumTile,
     AlbumTileCache,
     ColorArray,
+    MatchMode,
     RgbArray,
     calculate_cell_lab_means_array,
     match_artwork,
@@ -30,6 +31,7 @@ class MosaicRenderPlan:
         height: int,
         album_tiles: Sequence[AlbumTile],
         target_tile_count: int,
+        match_mode: MatchMode = MatchMode.NEAREST,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("Target dimensions must be positive")
@@ -38,6 +40,9 @@ class MosaicRenderPlan:
         self.width = width
         self.height = height
         self.album_tiles = tuple(album_tiles)
+        if not isinstance(match_mode, MatchMode):
+            raise TypeError("match_mode must be a MatchMode")
+        self.match_mode = match_mode
         self.grid: GridSpec = calculate_grid(width, height, target_tile_count)
         self.album_index = AlbumLabIndex.from_tiles(self.album_tiles)
         self.x_edges = np.linspace(0, width, self.grid.columns + 1, dtype=np.intp)
@@ -51,7 +56,7 @@ class MosaicRenderPlan:
 
     def match(self, target_means: ColorArray) -> NDArray[np.intp]:
         """Match all target cells through the precomputed album LAB index."""
-        return self.album_index.nearest(target_means)
+        return self.album_index.match(target_means, self.match_mode)
 
     def compose_bgr(self, matches: NDArray[np.intp]) -> RgbArray:
         """Compose a BGR output frame using persistent resized-tile caches."""
@@ -121,6 +126,7 @@ def render_mosaic(
     *,
     tile_cache: AlbumTileCache | None = None,
     blend_alpha: float = 0.0,
+    match_mode: MatchMode = MatchMode.NEAREST,
 ) -> Image.Image:
     """Render a target-sized photomosaic from reusable album-cover images."""
     alpha = validate_blend_alpha(blend_alpha)
@@ -141,7 +147,7 @@ def render_mosaic(
         else cache.get(identifier=f"album-{index}", image=item)
         for index, item in enumerate(album_images)
     )
-    matches = match_artwork(target_image, album_tiles, grid)
+    matches = match_artwork(target_image, album_tiles, grid, match_mode)
 
     output = Image.new("RGB", target_image.size)
     x_edges = np.linspace(0, target_image.width, grid.columns + 1, dtype=int)

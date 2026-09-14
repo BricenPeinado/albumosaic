@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from app.mosaic.matcher import AlbumTile, AlbumTileCache
+from app.mosaic.matcher import AlbumTile, AlbumTileCache, MatchMode
 from app.mosaic.renderer import MosaicRenderPlan, blend_uint8_frames, render_mosaic
 
 
@@ -36,6 +36,57 @@ def test_render_mosaic_reuses_explicit_tile_cache() -> None:
 
     assert cache.get("album-0", albums[0]) is first_tile
     assert len(cache) == 1
+
+
+def test_render_plan_keeps_match_mode_as_frame_invariant_configuration() -> None:
+    tiles = tuple(
+        AlbumTile(str(index), Image.new("RGB", (8, 8), value))
+        for index, value in enumerate(("black", "gray", "white"))
+    )
+    plan = MosaicRenderPlan(
+        20,
+        10,
+        tiles,
+        2,
+        MatchMode.UNIQUE_PER_FRAME,
+    )
+    target_means = np.zeros((plan.grid.tile_count, 3), dtype=np.float32)
+
+    matches = plan.match(target_means)
+
+    assert plan.match_mode is MatchMode.UNIQUE_PER_FRAME
+    assert len(set(matches.tolist())) == plan.grid.tile_count
+
+
+def test_still_renderer_supports_unique_mode_without_changing_blending() -> None:
+    target = Image.new("RGB", (20, 20), (12, 34, 56))
+    albums = [
+        Image.new("RGB", (8, 8), color)
+        for color in ((0, 0, 0), (64, 0, 0), (128, 0, 0), (255, 0, 0))
+    ]
+
+    mosaic = render_mosaic(
+        target,
+        albums,
+        4,
+        match_mode=MatchMode.UNIQUE_PER_FRAME,
+    )
+    original_only = render_mosaic(
+        target,
+        albums,
+        4,
+        match_mode=MatchMode.UNIQUE_PER_FRAME,
+        blend_alpha=1.0,
+    )
+
+    sampled_colors = {
+        mosaic.getpixel((5, 5)),
+        mosaic.getpixel((15, 5)),
+        mosaic.getpixel((5, 15)),
+        mosaic.getpixel((15, 15)),
+    }
+    assert sampled_colors == {(0, 0, 0), (64, 0, 0), (128, 0, 0), (255, 0, 0)}
+    assert original_only.tobytes() == target.tobytes()
 
 
 def test_render_mosaic_requires_album_images() -> None:

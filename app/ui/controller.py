@@ -8,6 +8,7 @@ from typing import Any
 
 import gradio as gr
 
+from app.mosaic.matcher import MatchMode
 from app.playlist.models import Playlist
 from app.workflow import AlbumosaicWorkflow, WorkflowProgress
 
@@ -23,6 +24,7 @@ class AlbumosaicUIController:
         playlist_url: str,
         video_path: str | None,
         tile_count: int,
+        unique_per_frame: bool,
     ) -> Iterator[tuple[Any, ...]]:
         """Resolve playlist input and enable density-dependent controls."""
         yield (
@@ -54,7 +56,12 @@ class AlbumosaicUIController:
                     value=selected_count,
                     interactive=True,
                 ),
-                self.grid_text(video_path, selected_count),
+                self.grid_text(
+                    video_path,
+                    selected_count,
+                    playlist,
+                    unique_per_frame,
+                ),
                 gr.update(interactive=bool(video_path)),
                 "Playlist ready",
                 0,
@@ -77,12 +84,22 @@ class AlbumosaicUIController:
         video_path: str | None,
         tile_count: int,
         playlist: Playlist | None,
+        unique_per_frame: bool,
     ) -> tuple[str, dict[str, Any]]:
         """Refresh the grid estimate and Generate button state."""
         ready = playlist is not None and bool(video_path)
-        return self.grid_text(video_path, tile_count), gr.update(interactive=ready)
+        return (
+            self.grid_text(video_path, tile_count, playlist, unique_per_frame),
+            gr.update(interactive=ready),
+        )
 
-    def grid_text(self, video_path: str | None, tile_count: int) -> str:
+    def grid_text(
+        self,
+        video_path: str | None,
+        tile_count: int,
+        playlist: Playlist | None = None,
+        unique_per_frame: bool = False,
+    ) -> str:
         """Return a concise aspect-aware grid summary."""
         if not video_path:
             return "Mosaic grid: add a video to see the estimate."
@@ -90,7 +107,22 @@ class AlbumosaicUIController:
             grid = self.workflow.grid_for_video(video_path, tile_count)
         except Exception as error:
             return f"Mosaic grid: unavailable ({error})"
-        return f"Mosaic grid: approximately **{grid.columns} × {grid.rows}**"
+        summary = (
+            f"Mosaic grid: approximately **{grid.columns} × {grid.rows}** "
+            f"({grid.tile_count} tiles)"
+        )
+        if (
+            unique_per_frame
+            and playlist is not None
+            and grid.tile_count > playlist.unique_album_count
+        ):
+            repeats = grid.tile_count - playlist.unique_album_count
+            repeat_label = "repeat" if repeats == 1 else "repeats"
+            summary += (
+                f"  \n{playlist.unique_album_count} unique albums available — "
+                f"up to {repeats} {repeat_label} may be required."
+            )
+        return summary
 
     def generate(
         self,
@@ -98,6 +130,7 @@ class AlbumosaicUIController:
         video_path: str | None,
         tile_count: int,
         blend_percentage: float,
+        unique_per_frame: bool,
     ) -> Iterator[tuple[Any, ...]]:
         """Run the blocking workflow in a worker and stream its progress."""
         if playlist is None:
@@ -119,6 +152,7 @@ class AlbumosaicUIController:
                         ("progress", progress)
                     ),
                     blend_alpha=blend_percentage_to_alpha(blend_percentage),
+                    match_mode=match_mode_from_unique(unique_per_frame),
                 )
             except Exception as error:
                 updates.put(("error", error))
@@ -203,3 +237,12 @@ def blend_percentage_to_alpha(blend_percentage: float) -> float:
 def format_blend_percentage(blend_percentage: float) -> str:
     """Format the integer UI slider value as a percentage."""
     return f"Selected blend: **{round(blend_percentage)}%**"
+
+
+def match_mode_from_unique(unique_per_frame: bool) -> MatchMode:
+    """Convert the checkbox state into a domain matching mode."""
+    if not isinstance(unique_per_frame, bool):
+        raise TypeError("Unique-per-frame setting must be a boolean")
+    if unique_per_frame:
+        return MatchMode.UNIQUE_PER_FRAME
+    return MatchMode.NEAREST
