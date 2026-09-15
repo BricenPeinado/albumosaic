@@ -10,6 +10,11 @@ import gradio as gr
 
 from app.mosaic.matcher import MatchMode
 from app.playlist.models import Playlist
+from app.playlist.progress import (
+    PreparationProgress,
+    PreparationProgressReporter,
+    PreparationStage,
+)
 from app.workflow import AlbumosaicWorkflow, PreparedPlaylist, WorkflowProgress
 
 
@@ -28,7 +33,7 @@ class AlbumosaicUIController:
     ) -> Iterator[tuple[Any, ...]]:
         """Resolve playlist input and enable density-dependent controls."""
         yield from self._resolve_prepared(
-            lambda: self.workflow.prepare_playlist(playlist_url),
+            lambda reporter: self.workflow.prepare_playlist(playlist_url, reporter),
             video_path,
             tile_count,
             unique_per_frame,
@@ -45,7 +50,7 @@ class AlbumosaicUIController:
         if not csv_path:
             return
         yield from self._resolve_prepared(
-            lambda: self.workflow.prepare_exportify(csv_path),
+            lambda reporter: self.workflow.prepare_exportify(csv_path, reporter),
             video_path,
             tile_count,
             unique_per_frame,
@@ -53,24 +58,92 @@ class AlbumosaicUIController:
 
     def _resolve_prepared(
         self,
-        prepare: Callable[[], PreparedPlaylist],
+        prepare: Callable[[PreparationProgressReporter], PreparedPlaylist],
         video_path: str | None,
         tile_count: int,
         unique_per_frame: bool,
     ) -> Iterator[tuple[Any, ...]]:
+        updates: Queue[tuple[str, object]] = Queue()
+
+        def run_preparation() -> None:
+            try:
+                prepared = prepare(lambda progress: updates.put(("progress", progress)))
+            except Exception as error:
+                updates.put(("error", error))
+            else:
+                updates.put(("result", prepared))
+
+        Thread(target=run_preparation, daemon=True).start()
+        displayed_percentage = 0
+        displayed_processed: dict[PreparationStage, int] = {}
         yield (
             None,
-            "Resolving playlist and independent artwork…",
+            "Fetching playlist metadata…",
             gr.update(minimum=2, maximum=3, value=2, interactive=False),
             "Mosaic grid: add a video after resolving your playlist.",
             gr.update(interactive=False),
-            self._stage_text(1, "Resolving playlist"),
+            self._preparation_stage_text(PreparationStage.FETCHING_PLAYLIST),
             0,
-            "Frames processed: —",
+            "Preparation started",
         )
 
-        try:
-            prepared = prepare()
+        while True:
+            kind, payload = updates.get()
+            if kind == "progress":
+                assert isinstance(payload, PreparationProgress)
+                processed = max(
+                    displayed_processed.get(payload.stage, 0),
+                    payload.processed,
+                )
+                displayed_processed[payload.stage] = processed
+                display_progress = PreparationProgress(
+                    payload.stage,
+                    processed,
+                    payload.total,
+                    payload.message,
+                )
+                displayed_percentage = max(
+                    displayed_percentage,
+                    self._preparation_percentage(display_progress),
+                )
+                yield (
+                    None,
+                    payload.message.replace("\n", "  \n"),
+                    gr.update(interactive=False),
+                    "Mosaic grid: waiting for playlist preparation.",
+                    gr.update(interactive=False),
+                    self._preparation_stage_text(payload.stage),
+                    displayed_percentage,
+                    self._preparation_count_text(display_progress),
+                )
+                continue
+            if kind == "error":
+                assert isinstance(payload, Exception)
+                yield (
+                    None,
+                    f"Could not resolve playlist: {payload}",
+                    gr.update(minimum=2, maximum=3, value=2, interactive=False),
+                    "Mosaic grid: unavailable",
+                    gr.update(interactive=False),
+                    "Playlist resolution stopped",
+                    0,
+                    "Preparation stopped",
+                )
+                return
+            if not isinstance(payload, PreparedPlaylist):
+                yield (
+                    None,
+                    "Could not resolve playlist: invalid preparation result",
+                    gr.update(minimum=2, maximum=3, value=2, interactive=False),
+                    "Mosaic grid: unavailable",
+                    gr.update(interactive=False),
+                    "Playlist resolution stopped",
+                    0,
+                    "Preparation stopped",
+                )
+                return
+
+            prepared = payload
             playlist = prepared.playlist
             album_count = playlist.unique_album_count
             usable_count = prepared.usable_album_count
@@ -95,21 +168,11 @@ class AlbumosaicUIController:
                     unique_per_frame,
                 ),
                 gr.update(interactive=bool(video_path) and usable_count >= 2),
-                "Playlist ready",
-                0,
-                "Frames processed: —",
+                "### Playlist ready",
+                100,
+                (f"Independent artwork: **{usable_count} / {album_count} albums**"),
             )
-        except Exception as error:
-            yield (
-                None,
-                f"Could not resolve playlist: {error}",
-                gr.update(minimum=2, maximum=3, value=2, interactive=False),
-                "Mosaic grid: unavailable",
-                gr.update(interactive=False),
-                "Playlist resolution stopped",
-                0,
-                "Frames processed: —",
-            )
+            return
 
     def connect_spotify(self) -> str:
         """Run configured OAuth without exposing token details to Gradio."""
@@ -248,6 +311,27 @@ class AlbumosaicUIController:
     @staticmethod
     def _stage_text(number: int, label: str) -> str:
         return f"### Stage {number} of 6 · {label}"
+
+    @staticmethod
+    def _preparation_stage_text(stage: PreparationStage) -> str:
+        return f"### Preparing playlist · {stage.value}"
+
+    @staticmethod
+    def _preparation_percentage(progress: PreparationProgress) -> int:
+        fraction = progress.processed / progress.total if progress.total else 0.0
+        if progress.stage is PreparationStage.FETCHING_PLAYLIST:
+            return round(fraction * 10)
+        if progress.stage is PreparationStage.RESOLVING_ARTWORK:
+            return min(65, 10 + round(fraction * 55))
+        if progress.stage is PreparationStage.DOWNLOADING_ARTWORK:
+            return min(95, 65 + round(fraction * 30))
+        return 100
+
+    @staticmethod
+    def _preparation_count_text(progress: PreparationProgress) -> str:
+        if progress.total:
+            return f"Preparation: **{progress.processed} / {progress.total}**"
+        return "Preparation in progress"
 
     @staticmethod
     def _frames_text(progress: WorkflowProgress) -> str:

@@ -74,7 +74,7 @@ def test_pkce_callback_exchanges_code_and_validates_state(
             {"access_token": "access", "refresh_token": "refresh", "expires_in": 3600}
         )
 
-    monkeypatch.setattr(spotify_auth, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spotify_auth, "open_url", fake_urlopen)
     manager = SpotifyOAuthManager(SpotifyOAuthConfig("client"))
     authorization_url = manager.begin_authorization()
     query = parse_qs(urlparse(authorization_url).query)
@@ -146,7 +146,7 @@ def test_missing_verifier_is_rejected_before_exchange(
         calls += 1
         return JsonResponse({})
 
-    monkeypatch.setattr(spotify_auth, "urlopen", unexpected_urlopen)
+    monkeypatch.setattr(spotify_auth, "open_url", unexpected_urlopen)
 
     with pytest.raises(SpotifyAuthenticationError, match="no associated PKCE verifier"):
         manager.complete_callback(f"/spotify/callback?code=abc&state={state}")
@@ -164,7 +164,7 @@ def test_state_and_authorization_code_cannot_be_exchanged_twice(
         calls += 1
         return JsonResponse({"access_token": "access", "expires_in": 3600})
 
-    monkeypatch.setattr(spotify_auth, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spotify_auth, "open_url", fake_urlopen)
     manager = SpotifyOAuthManager(SpotifyOAuthConfig("client"))
     query = parse_qs(urlparse(manager.begin_authorization()).query)
     callback = f"/spotify/callback?code=single-use&state={query['state'][0]}"
@@ -208,7 +208,7 @@ def test_spotify_oauth_error_details_are_preserved(
     )
     monkeypatch.setattr(
         spotify_auth,
-        "urlopen",
+        "open_url",
         lambda request, timeout: (_ for _ in ()).throw(error),
     )
     manager = SpotifyOAuthManager(SpotifyOAuthConfig("client"))
@@ -263,7 +263,7 @@ def test_callback_server_preserves_token_exchange_error(
     monkeypatch.setattr(spotify_auth, "open_browser", lambda url: True)
     monkeypatch.setattr(
         spotify_auth,
-        "urlopen",
+        "open_url",
         lambda request, timeout: (_ for _ in ()).throw(token_error),
     )
 
@@ -284,7 +284,7 @@ def test_debug_diagnostics_are_safe(
 ) -> None:
     monkeypatch.setattr(
         spotify_auth,
-        "urlopen",
+        "open_url",
         lambda request, timeout: JsonResponse(
             {"access_token": "secret-access", "expires_in": 3600}
         ),
@@ -315,7 +315,7 @@ def test_expired_token_is_refreshed(monkeypatch: pytest.MonkeyPatch) -> None:
     manager._token = SpotifyToken("expired", "refresh", 0)
     monkeypatch.setattr(
         spotify_auth,
-        "urlopen",
+        "open_url",
         lambda request, timeout: JsonResponse(
             {"access_token": "fresh", "expires_in": 3600}
         ),

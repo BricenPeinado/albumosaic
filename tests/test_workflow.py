@@ -8,6 +8,11 @@ from PIL import Image
 from app.mosaic.matcher import MatchMode
 from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
+from app.playlist.progress import (
+    PreparationProgress,
+    PreparationProgressReporter,
+    PreparationStage,
+)
 from app.playlist.source import PlaylistInput, PlaylistSource
 from app.playlist.spotify import SpotifyPlaylistSource
 from app.workflow import (
@@ -54,8 +59,21 @@ class _ArtworkProvider:
     def __init__(self, paths: tuple[Path, ...]) -> None:
         self.paths = paths
 
-    def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+    def get_many(
+        self,
+        albums: tuple[Album, ...],
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> tuple[ResolvedArtwork, ...]:
         assert len(albums) == len(self.paths)
+        if progress_reporter is not None:
+            progress_reporter(
+                PreparationProgress(
+                    PreparationStage.RESOLVING_ARTWORK,
+                    len(albums),
+                    len(albums),
+                    "Artwork resolved",
+                )
+            )
         return tuple(
             ResolvedArtwork(album, path)
             for album, path in zip(albums, self.paths, strict=True)
@@ -154,7 +172,12 @@ def test_generation_requires_two_independently_resolved_albums(
     Image.new("RGB", (12, 12), "red").save(cover)
 
     class PartialProvider:
-        def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+        def get_many(
+            self,
+            albums: tuple[Album, ...],
+            progress_reporter: PreparationProgressReporter | None = None,
+        ) -> tuple[ResolvedArtwork, ...]:
+            del progress_reporter
             return (ResolvedArtwork(albums[0], cover),)
 
     workflow = AlbumosaicWorkflow(
@@ -177,12 +200,40 @@ def test_exportify_uses_the_same_independent_artwork_provider(tmp_path: Path) ->
     observed: list[tuple[Album, ...]] = []
 
     class RecordingProvider:
-        def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+        def get_many(
+            self,
+            albums: tuple[Album, ...],
+            progress_reporter: PreparationProgressReporter | None = None,
+        ) -> tuple[ResolvedArtwork, ...]:
+            del progress_reporter
             observed.append(albums)
             return ()
 
     workflow = AlbumosaicWorkflow(artwork_provider=RecordingProvider())
-    prepared = workflow.prepare_exportify(csv_path)
+    with pytest.raises(ValueError, match="At least two albums"):
+        workflow.prepare_exportify(csv_path)
 
-    assert prepared.usable_album_count == 0
     assert observed[0][0].album_name == "Album"
+
+
+def test_playlist_preparation_reports_metadata_artwork_and_ready(
+    tmp_path: Path,
+) -> None:
+    playlist = _playlist()
+    artwork_paths = (tmp_path / "one.png", tmp_path / "two.png")
+    workflow = AlbumosaicWorkflow(
+        playlist_source=_PlaylistSource(playlist),
+        artwork_provider=_ArtworkProvider(artwork_paths),
+    )
+    progress: list[PreparationProgress] = []
+
+    prepared = workflow.prepare_playlist("playlist-input", progress.append)
+
+    assert prepared.usable_album_count == 2
+    assert [update.stage for update in progress] == [
+        PreparationStage.FETCHING_PLAYLIST,
+        PreparationStage.FETCHING_PLAYLIST,
+        PreparationStage.RESOLVING_ARTWORK,
+        PreparationStage.READY,
+    ]
+    assert "2 tracks / 2 unique albums" in progress[1].message

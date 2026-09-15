@@ -3,6 +3,7 @@
 Albumosaic uses the following open-source projects at runtime. Their own
 license terms apply:
 
+- [certifi](https://github.com/certifi/python-certifi) — Mozilla Public License 2.0
 - [Gradio](https://github.com/gradio-app/gradio) — Apache License 2.0
 - [NumPy](https://github.com/numpy/numpy) — BSD and bundled component licenses
 - [OpenCV](https://github.com/opencv/opencv) — Apache License 2.0

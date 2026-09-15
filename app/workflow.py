@@ -1,10 +1,12 @@
 """Provider-neutral application workflow for the Albumosaic UI."""
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from os import environ
 from pathlib import Path
+from time import perf_counter
 from typing import Protocol
 from uuid import uuid4
 
@@ -22,11 +24,18 @@ from app.playlist.artwork_sources import (
 )
 from app.playlist.exportify import ExportifyCSVSource
 from app.playlist.models import Album, Playlist
+from app.playlist.progress import (
+    PreparationProgress,
+    PreparationProgressReporter,
+    PreparationStage,
+)
 from app.playlist.source import PlaylistInput, PlaylistSource
 from app.playlist.spotify import SpotifyPlaylistSource, parse_spotify_playlist_url
 from app.playlist.spotify_auth import SpotifyOAuthConfig, SpotifyOAuthManager
 from app.video.reader import VideoReader
 from app.video.renderer import render_video
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowStage(Enum):
@@ -96,7 +105,11 @@ class UnconfiguredSpotifyPlaylistSource(PlaylistSource):
 class ArtworkProvider(Protocol):
     """Small boundary used by the workflow for artwork retrieval."""
 
-    def get_many(self, albums: tuple[Album, ...]) -> tuple[ResolvedArtwork, ...]:
+    def get_many(
+        self,
+        albums: tuple[Album, ...],
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> tuple[ResolvedArtwork, ...]:
         """Return independently resolved local artwork in album order."""
 
 
@@ -141,20 +154,122 @@ class AlbumosaicWorkflow:
         connect()
         return self.playlist_connection_status
 
-    def prepare_playlist(self, playlist_url: str) -> PreparedPlaylist:
+    def prepare_playlist(
+        self,
+        playlist_url: str,
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> PreparedPlaylist:
         """Resolve Spotify metadata and independent artwork for UI use."""
-        playlist = self.resolve_playlist(playlist_url)
-        return self.prepare_artwork(playlist)
-
-    def prepare_exportify(self, csv_path: str | Path) -> PreparedPlaylist:
-        """Resolve an Exportify CSV through the same independent art provider."""
-        playlist = ExportifyCSVSource().resolve_playlist(csv_path)
-        return self.prepare_artwork(playlist)
-
-    def prepare_artwork(self, playlist: Playlist) -> PreparedPlaylist:
-        return PreparedPlaylist(
-            playlist, self.artwork_provider.get_many(playlist.albums)
+        report = progress_reporter or (lambda _progress: None)
+        report(
+            PreparationProgress(
+                PreparationStage.FETCHING_PLAYLIST,
+                0,
+                1,
+                "Fetching Spotify playlist metadata…",
+            )
         )
+        metadata_started = perf_counter()
+        playlist = self.resolve_playlist(playlist_url)
+        metadata_elapsed = perf_counter() - metadata_started
+        logger.debug(
+            "Spotify metadata: %.2fs, tracks=%d, unique_albums=%d",
+            metadata_elapsed,
+            len(playlist.tracks),
+            playlist.unique_album_count,
+        )
+        report(
+            PreparationProgress(
+                PreparationStage.FETCHING_PLAYLIST,
+                1,
+                1,
+                (
+                    f"Spotify metadata loaded: {len(playlist.tracks)} tracks / "
+                    f"{playlist.unique_album_count} unique albums"
+                ),
+            )
+        )
+        artwork_started = perf_counter()
+        prepared = self.prepare_artwork(playlist, report)
+        artwork_elapsed = perf_counter() - artwork_started
+        logger.debug(
+            "Playlist preparation summary: Spotify metadata %.2fs, artwork %.2fs, "
+            "usable=%d/%d",
+            metadata_elapsed,
+            artwork_elapsed,
+            prepared.usable_album_count,
+            playlist.unique_album_count,
+        )
+        report(
+            PreparationProgress(
+                PreparationStage.READY,
+                prepared.usable_album_count,
+                playlist.unique_album_count,
+                (
+                    f"Playlist ready: independent artwork found for "
+                    f"{prepared.usable_album_count} of "
+                    f"{playlist.unique_album_count} albums"
+                ),
+            )
+        )
+        return prepared
+
+    def prepare_exportify(
+        self,
+        csv_path: str | Path,
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> PreparedPlaylist:
+        """Resolve an Exportify CSV through the same independent art provider."""
+        report = progress_reporter or (lambda _progress: None)
+        report(
+            PreparationProgress(
+                PreparationStage.FETCHING_PLAYLIST,
+                0,
+                1,
+                "Reading Exportify playlist metadata…",
+            )
+        )
+        playlist = ExportifyCSVSource().resolve_playlist(csv_path)
+        report(
+            PreparationProgress(
+                PreparationStage.FETCHING_PLAYLIST,
+                1,
+                1,
+                (
+                    f"Exportify metadata loaded: {len(playlist.tracks)} tracks / "
+                    f"{playlist.unique_album_count} unique albums"
+                ),
+            )
+        )
+        prepared = self.prepare_artwork(playlist, report)
+        report(
+            PreparationProgress(
+                PreparationStage.READY,
+                prepared.usable_album_count,
+                playlist.unique_album_count,
+                (
+                    f"Playlist ready: independent artwork found for "
+                    f"{prepared.usable_album_count} of "
+                    f"{playlist.unique_album_count} albums"
+                ),
+            )
+        )
+        return prepared
+
+    def prepare_artwork(
+        self,
+        playlist: Playlist,
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> PreparedPlaylist:
+        artwork = self.artwork_provider.get_many(
+            playlist.albums,
+            progress_reporter,
+        )
+        if len(artwork) < 2:
+            raise ValueError(
+                "At least two albums need independently resolved artwork before rendering"
+            )
+        return PreparedPlaylist(playlist, artwork)
 
     def grid_for_video(
         self,

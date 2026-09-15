@@ -15,16 +15,17 @@ from time import sleep
 from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from PIL import Image, UnidentifiedImageError
 
+from app.network import open_url
 from app.playlist.models import Album
 
 if TYPE_CHECKING:
     from app.playlist.artwork_sources import ArtworkReference
 
-_DEFAULT_TIMEOUT_SECONDS = 10.0
+_DEFAULT_TIMEOUT_SECONDS = 8.0
 _DEFAULT_RETRIES = 2
 _DEFAULT_MAX_WORKERS = 4
 _MAX_WORKERS = 16
@@ -118,10 +119,7 @@ class ArtworkCache:
 
     def get(self, album: Album, reference: ArtworkReference) -> Path:
         """Cache a validated independent URL or user-provided local image."""
-        identity = "\x1f".join(
-            (*album.identity_key, reference.provider, reference.identifier)
-        )
-        cache_key = sha256(identity.encode("utf-8")).hexdigest()
+        cache_key = self._reference_cache_key(album, reference)
         artwork_path = self.artwork_dir / f"{cache_key}.png"
         with self._lock_for(cache_key):
             if _valid_cached_artwork(artwork_path, self.max_artwork_pixels):
@@ -164,6 +162,19 @@ class ArtworkCache:
                 raise
             return artwork_path
 
+    def cached_path(
+        self,
+        album: Album,
+        reference: ArtworkReference,
+    ) -> Path | None:
+        """Return a valid cached artwork path without performing network I/O."""
+        cache_key = self._reference_cache_key(album, reference)
+        artwork_path = self.artwork_dir / f"{cache_key}.png"
+        with self._lock_for(cache_key):
+            if _valid_cached_artwork(artwork_path, self.max_artwork_pixels):
+                return artwork_path
+        return None
+
     def get_many(
         self,
         references: Sequence[tuple[Album, ArtworkReference]],
@@ -179,6 +190,13 @@ class ArtworkCache:
 
     def _get_pair(self, pair: tuple[Album, ArtworkReference]) -> Path:
         return self.get(*pair)
+
+    @staticmethod
+    def _reference_cache_key(album: Album, reference: ArtworkReference) -> str:
+        identity = "\x1f".join(
+            (*album.identity_key, reference.provider, reference.identifier)
+        )
+        return sha256(identity.encode("utf-8")).hexdigest()
 
     def _download(self, artwork_url: str) -> tuple[bytes, str]:
         parsed_url = urlparse(artwork_url)
@@ -225,7 +243,7 @@ class ArtworkCache:
             artwork_url,
             headers={"User-Agent": "Albumosaic/0.1"},
         )
-        with urlopen(request, timeout=self.timeout) as response:
+        with open_url(request, timeout=self.timeout) as response:
             final_url = getattr(response, "geturl", lambda: artwork_url)()
             final_host = urlparse(final_url).hostname
             if self.allowed_hosts is not None and (

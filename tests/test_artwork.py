@@ -86,7 +86,7 @@ def test_download_validates_and_stores_original_square_rgb_artwork(
         requested_timeouts.append(timeout)
         return FakeResponse(image_bytes())
 
-    monkeypatch.setattr(artwork, "urlopen", fake_urlopen)
+    monkeypatch.setattr(artwork, "open_url", fake_urlopen)
     cache = ArtworkCache(tmp_path, timeout=1.5)
 
     path = cache.get(make_album(), remote_reference())
@@ -119,7 +119,7 @@ def test_valid_cached_artwork_is_never_redownloaded(
         calls += 1
         return FakeResponse(image_bytes())
 
-    monkeypatch.setattr(artwork, "urlopen", fake_urlopen)
+    monkeypatch.setattr(artwork, "open_url", fake_urlopen)
     cache = ArtworkCache(tmp_path)
 
     reference = remote_reference()
@@ -152,7 +152,7 @@ def test_transient_download_failures_are_retried(
             raise URLError("temporary failure")
         return FakeResponse(image_bytes())
 
-    monkeypatch.setattr(artwork, "urlopen", flaky_urlopen)
+    monkeypatch.setattr(artwork, "open_url", flaky_urlopen)
     cache = ArtworkCache(tmp_path, retries=2, retry_backoff=0)
 
     assert cache.get(make_album(), remote_reference()).is_file()
@@ -176,7 +176,7 @@ def test_malformed_artwork_is_rejected_without_cache_files(
 ) -> None:
     monkeypatch.setattr(
         artwork,
-        "urlopen",
+        "open_url",
         lambda request, timeout: FakeResponse(payload, content_type=content_type),
     )
     cache = ArtworkCache(tmp_path)
@@ -201,7 +201,7 @@ def test_get_many_deduplicates_albums_and_preserves_order(
 ) -> None:
     monkeypatch.setattr(
         artwork,
-        "urlopen",
+        "open_url",
         lambda request, timeout: FakeResponse(image_bytes()),
     )
     first = make_album("album-1")
@@ -248,7 +248,7 @@ def test_concurrent_downloads_respect_worker_limit(
 
     monkeypatch.setattr(
         artwork,
-        "urlopen",
+        "open_url",
         lambda request, timeout: MeasuredResponse(image_bytes()),
     )
     references = tuple(
@@ -276,7 +276,7 @@ def test_artwork_pixel_limit_rejects_decompression_risk(
 ) -> None:
     monkeypatch.setattr(
         artwork,
-        "urlopen",
+        "open_url",
         lambda request, timeout: FakeResponse(image_bytes((32, 32))),
     )
     cache = ArtworkCache(tmp_path, max_artwork_pixels=100)

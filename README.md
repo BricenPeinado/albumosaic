@@ -161,7 +161,13 @@ stable album-identity keys, validates HTTP responses and images, stores square
 RGB PNG files, and writes metadata atomically. Valid files are reused.
 
 MusicBrainz requests use a contact-bearing User-Agent and are serialized to at
-most one request per second. Album identity mappings are cached. Network access
+most one request per second. Successful album identity mappings are cached;
+unresolved albums are retried on later runs rather than permanently cached as
+failures. Cover Art Archive JSON lookups and artwork downloads may overlap with
+other work, with a four-worker limit. The interactive request timeouts are 7
+seconds for MusicBrainz search, 5 seconds for Cover Art Archive lookup, and 8
+seconds for artwork download. A failed album is skipped while the rest continue.
+Network access
 is restricted to these service hosts:
 
 - `accounts.spotify.com` for OAuth
@@ -207,10 +213,13 @@ python -m app.main --help
 python -m app.main --host 127.0.0.1 --port 7860
 ```
 
-Open the displayed local URL to use the interface. The page resolves playlists
-through an injected `PlaylistSource`, updates density from the unique-album
-count, previews the calculated grid, streams all six generation stages, and
-exposes the completed MP4 for preview and download.
+Open the displayed local URL to use the interface. Playlist preparation runs in
+a worker and streams metadata, per-album artwork resolution, download/cache,
+and ready status before enabling density. The page resolves playlists through
+an injected `PlaylistSource`, updates density from the unique-album count,
+previews the calculated grid, streams all six generation stages, and exposes
+the completed MP4 for preview and download. Use `--debug` to see per-album
+MusicBrainz, Cover Art Archive, and cache timings without exposing OAuth secrets.
 
 When `SPOTIFY_CLIENT_ID` is absent, the app starts normally and explains the
 missing setup. Exportify and local artwork remain available.

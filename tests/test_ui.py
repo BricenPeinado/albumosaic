@@ -1,6 +1,7 @@
 """Tests for the Gradio interface and its thin event controller."""
 
 from pathlib import Path
+from threading import Event
 
 import gradio as gr
 import pytest
@@ -9,6 +10,11 @@ from app.mosaic.grid import GridSpec
 from app.mosaic.matcher import MatchMode
 from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
+from app.playlist.progress import (
+    PreparationProgress,
+    PreparationProgressReporter,
+    PreparationStage,
+)
 from app.ui.app import build_interface
 from app.ui.controller import (
     AlbumosaicUIController,
@@ -42,9 +48,22 @@ def _playlist() -> Playlist:
 class _FakeWorkflow:
     last_match_mode: MatchMode | None = None
 
-    def prepare_playlist(self, playlist_url: str) -> PreparedPlaylist:
+    def prepare_playlist(
+        self,
+        playlist_url: str,
+        progress_reporter: PreparationProgressReporter | None = None,
+    ) -> PreparedPlaylist:
         assert playlist_url == "https://open.spotify.com/playlist/abc123"
         playlist = _playlist()
+        if progress_reporter is not None:
+            progress_reporter(
+                PreparationProgress(
+                    PreparationStage.RESOLVING_ARTWORK,
+                    1,
+                    3,
+                    'Finding artwork for album 1 / 3\n"Album 0" — Artist',
+                )
+            )
         artwork = tuple(
             ResolvedArtwork(album, Path(f"{index}.png"))
             for index, album in enumerate(playlist.albums)
@@ -88,6 +107,48 @@ def test_playlist_resolution_enables_density_with_unique_album_maximum() -> None
     assert final[2]["interactive"] is True
     assert final[3] == "Mosaic grid: approximately **2 × 2** (4 tiles)"
     assert final[4]["interactive"] is True
+
+
+def test_controller_streams_preparation_progress_before_completion() -> None:
+    release = Event()
+
+    class BlockingWorkflow(_FakeWorkflow):
+        def prepare_playlist(
+            self,
+            playlist_url: str,
+            progress_reporter: PreparationProgressReporter | None = None,
+        ) -> PreparedPlaylist:
+            assert progress_reporter is not None
+            progress_reporter(
+                PreparationProgress(
+                    PreparationStage.RESOLVING_ARTWORK,
+                    4,
+                    18,
+                    'Resolving album artwork 4 / 18\n"Loveless" — My Bloody Valentine',
+                )
+            )
+            assert release.wait(timeout=1)
+            return super().prepare_playlist(playlist_url)
+
+    controller = AlbumosaicUIController(BlockingWorkflow())  # type: ignore[arg-type]
+    updates = controller.resolve_playlist(
+        "https://open.spotify.com/playlist/abc123",
+        "video.mp4",
+        3,
+        False,
+    )
+
+    initial = next(updates)
+    streamed = next(updates)
+
+    assert "Fetching playlist" in initial[5]
+    assert "Resolving album artwork 4 / 18" in streamed[1]
+    assert streamed[6] > 0
+    assert streamed[0] is None
+
+    release.set()
+    final = list(updates)[-1]
+    assert isinstance(final[0], PreparedPlaylist)
 
 
 def test_generate_requires_a_resolved_playlist() -> None:

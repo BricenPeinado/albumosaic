@@ -6,8 +6,9 @@ from re import fullmatch
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
+from app.network import open_url
 from app.playlist.models import Album, Playlist, Track
 from app.playlist.source import PlaylistInput, PlaylistSource
 from app.playlist.spotify_auth import SpotifyAuthenticationError, SpotifyOAuthManager
@@ -155,7 +156,7 @@ class SpotifyPlaylistSource(PlaylistSource):
             headers={"Authorization": f"Bearer {self.oauth.access_token()}"},
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_url(request, timeout=self.timeout) as response:
                 return _json_object(response.read())
         except HTTPError as error:
             if error.code == 401 and not refreshed:

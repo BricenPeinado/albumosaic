@@ -86,7 +86,7 @@ def test_spotify_resolves_all_pages_deduplicates_and_ignores_images(
         requested_urls.append(request.full_url)  # type: ignore[attr-defined]
         return JsonResponse(next(pages))
 
-    monkeypatch.setattr(spotify, "urlopen", fake_urlopen)
+    monkeypatch.setattr(spotify, "open_url", fake_urlopen)
     playlist = SpotifyPlaylistSource(FakeOAuth()).resolve_playlist(
         "https://open.spotify.com/playlist/abc123"
     )
@@ -106,7 +106,9 @@ def test_malformed_and_non_track_items_are_skipped(
         "total": 4,
         "next": None,
     }
-    monkeypatch.setattr(spotify, "urlopen", lambda request, timeout: JsonResponse(page))
+    monkeypatch.setattr(
+        spotify, "open_url", lambda request, timeout: JsonResponse(page)
+    )
 
     playlist = SpotifyPlaylistSource(FakeOAuth()).resolve_playlist(
         "https://open.spotify.com/playlist/abc123"
@@ -135,7 +137,7 @@ def test_spotify_api_errors_are_user_friendly(
         del request, timeout
         raise HTTPError("url", status, "error", headers, None)
 
-    monkeypatch.setattr(spotify, "urlopen", fail)
+    monkeypatch.setattr(spotify, "open_url", fail)
 
     with pytest.raises(error_type, match=message):
         SpotifyPlaylistSource(FakeOAuth()).resolve_playlist(
@@ -155,7 +157,7 @@ def test_401_refreshes_once(monkeypatch: pytest.MonkeyPatch) -> None:
             raise HTTPError("url", 401, "unauthorized", Message(), None)
         return JsonResponse({"items": [], "total": 0, "next": None})
 
-    monkeypatch.setattr(spotify, "urlopen", response_after_refresh)
+    monkeypatch.setattr(spotify, "open_url", response_after_refresh)
     SpotifyPlaylistSource(oauth).resolve_playlist(
         "https://open.spotify.com/playlist/abc123"
     )
@@ -170,7 +172,7 @@ def test_repeated_401_requires_reconnection(monkeypatch: pytest.MonkeyPatch) -> 
         del request, timeout
         raise HTTPError("url", 401, "unauthorized", Message(), None)
 
-    monkeypatch.setattr(spotify, "urlopen", unauthorized)
+    monkeypatch.setattr(spotify, "open_url", unauthorized)
 
     with pytest.raises(SpotifyAuthenticationError, match="Connect Spotify again"):
         SpotifyPlaylistSource(oauth).resolve_playlist(

@@ -30,7 +30,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if args.debug:
         logging.basicConfig(level=logging.WARNING)
-        logging.getLogger("app.playlist.spotify_auth").setLevel(logging.DEBUG)
+        logging.getLogger("app").setLevel(logging.DEBUG)
     interface = build_interface()
     interface.launch(
         show_error=True,

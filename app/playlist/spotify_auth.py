@@ -16,8 +16,10 @@ from time import time
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from webbrowser import open as open_browser
+
+from app.network import open_url
 
 _AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -287,7 +289,7 @@ class SpotifyOAuthManager:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with open_url(request, timeout=self.timeout) as response:
                 status = response.getcode()
                 logger.debug("Spotify token endpoint HTTP status: %d", status)
                 payload = _json_object(response.read())
