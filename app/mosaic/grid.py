@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from math import ceil, floor, log, sqrt
 
 _COUNT_ERROR_WEIGHT = 2.0
+MAX_RENDER_DENSITY = 3000
+_MIN_CELL_SIDE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,38 @@ def calculate_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
         columns=columns,
         tile_count=rows * columns,
     )
+
+
+def calculate_render_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
+    """Apply practical rendering limits without changing aspect-aware grid search."""
+    if target_tile_count > MAX_RENDER_DENSITY:
+        raise ValueError(f"Mosaic density cannot exceed {MAX_RENDER_DENSITY} tiles")
+    adaptive_limit = maximum_render_density(width, height)
+    if target_tile_count > adaptive_limit:
+        raise ValueError(
+            f"Mosaic density cannot exceed {adaptive_limit} tiles "
+            f"at {width} × {height} pixels"
+        )
+    grid = calculate_grid(width, height, target_tile_count)
+    # Keep legacy two/four-cell rendering usable on tiny images. Higher densities
+    # must not turn each cover into an effectively sub-thumbnail patch.
+    if target_tile_count > 4 and (
+        grid.columns > width // _MIN_CELL_SIDE or grid.rows > height // _MIN_CELL_SIDE
+    ):
+        raise ValueError(
+            f"Mosaic density is too high for {width} × {height} pixels; "
+            f"cells must be at least {_MIN_CELL_SIDE} pixels wide and tall"
+        )
+    return grid
+
+
+def maximum_render_density(width: int, height: int) -> int:
+    """Return a resolution-based requested-cell ceiling under the backend cap."""
+    if width <= 0 or height <= 0:
+        raise ValueError("Video dimensions must be positive")
+    capacity = (width // _MIN_CELL_SIDE) * (height // _MIN_CELL_SIDE)
+    # Four low-density cells remain available for legacy tiny-image rendering.
+    return min(MAX_RENDER_DENSITY, max(4, capacity))
 
 
 def choose_grid(

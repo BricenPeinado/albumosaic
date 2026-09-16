@@ -19,6 +19,7 @@ EXPORTIFY_HEADERS = [
     "Album Name",
     "Album Artist Name(s)",
     "Album Release Date",
+    "Album Type",
     "Album Image URL",
     "Disc Number",
     "Track Number",
@@ -58,6 +59,7 @@ def exportify_row(
         "Album Name": album_name,
         "Album Artist Name(s)": album_artists,
         "Album Release Date": "2001-01-01",
+        "Album Type": "album",
         "Album Image URL": "https://images.example/cover.jpg",
         "Disc Number": "1",
         "Track Number": "2",
@@ -117,6 +119,7 @@ def test_exportify_extracts_tracks_albums_and_available_metadata() -> None:
     assert first_track.album.album_name == "The Album"
     assert first_track.album.artists == ("Main Artist",)
     assert first_track.album.release_date == "2001-01-01"
+    assert first_track.album.album_type == "album"
     assert first_track.album.album_id == "album-1"
     assert first_track.album.source_url == "https://open.spotify.com/album/album-1"
 

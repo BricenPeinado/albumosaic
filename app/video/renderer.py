@@ -1,5 +1,6 @@
 """Frame-by-frame mosaic rendering and H.264 MP4 finalization."""
 
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from os import close as close_file_descriptor
@@ -15,6 +16,8 @@ from app.video.audio import ensure_ffmpeg_available, finalize_h264_mp4
 from app.video.errors import UnsupportedCodecError
 from app.video.reader import VideoReader
 from app.video.writer import SilentVideoWriter, codec_for_output
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int], None]
 FinalizingCallback = Callable[[], None]
@@ -168,8 +171,10 @@ def render_video(
                     if progress_callback is not None:
                         progress_callback(writer.frames_written, metadata.frame_count)
 
+                snapshot = timings.snapshot(writer.frames_written)
+                logger.debug("%s", snapshot.format())
                 if timing_callback is not None:
-                    timing_callback(timings.snapshot(writer.frames_written))
+                    timing_callback(snapshot)
 
         if finalizing_callback is not None:
             finalizing_callback()

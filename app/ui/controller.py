@@ -17,6 +17,11 @@ from app.playlist.progress import (
 )
 from app.workflow import AlbumosaicWorkflow, PreparedPlaylist, WorkflowProgress
 
+DENSITY_MINIMUM = 4
+DENSITY_MAXIMUM = 1000
+DENSITY_DEFAULT = 200
+HIGH_DENSITY_WARNING_THRESHOLD = 1000
+
 
 class AlbumosaicUIController:
     """Translate workflow results into small Gradio event responses."""
@@ -79,7 +84,12 @@ class AlbumosaicUIController:
         yield (
             None,
             "Fetching playlist metadata…",
-            gr.update(minimum=2, maximum=3, value=2, interactive=False),
+            gr.update(
+                minimum=DENSITY_MINIMUM,
+                maximum=DENSITY_MAXIMUM,
+                value=DENSITY_DEFAULT,
+                interactive=False,
+            ),
             "Mosaic grid: add a video after resolving your playlist.",
             gr.update(interactive=False),
             self._preparation_stage_text(PreparationStage.FETCHING_PLAYLIST),
@@ -122,7 +132,12 @@ class AlbumosaicUIController:
                 yield (
                     None,
                     f"Could not resolve playlist: {payload}",
-                    gr.update(minimum=2, maximum=3, value=2, interactive=False),
+                    gr.update(
+                        minimum=DENSITY_MINIMUM,
+                        maximum=DENSITY_MAXIMUM,
+                        value=DENSITY_DEFAULT,
+                        interactive=False,
+                    ),
                     "Mosaic grid: unavailable",
                     gr.update(interactive=False),
                     "Playlist resolution stopped",
@@ -134,7 +149,12 @@ class AlbumosaicUIController:
                 yield (
                     None,
                     "Could not resolve playlist: invalid preparation result",
-                    gr.update(minimum=2, maximum=3, value=2, interactive=False),
+                    gr.update(
+                        minimum=DENSITY_MINIMUM,
+                        maximum=DENSITY_MAXIMUM,
+                        value=DENSITY_DEFAULT,
+                        interactive=False,
+                    ),
                     "Mosaic grid: unavailable",
                     gr.update(interactive=False),
                     "Playlist resolution stopped",
@@ -147,27 +167,33 @@ class AlbumosaicUIController:
             playlist = prepared.playlist
             album_count = playlist.unique_album_count
             usable_count = prepared.usable_album_count
-            selected_count = min(max(2, tile_count), max(2, album_count))
+            density_max = self._density_max(video_path)
+            selected_count = min(max(DENSITY_MINIMUM, tile_count), density_max)
+            grid_summary = self.grid_text(
+                video_path, selected_count, prepared, unique_per_frame
+            )
+            generation_ready = (
+                bool(video_path)
+                and usable_count >= 2
+                and not grid_summary.startswith("Mosaic grid: unavailable")
+            )
             yield (
                 prepared,
                 (
                     f"Found **{len(playlist.tracks)} tracks** across "
                     f"**{album_count} unique albums**.  \nIndependent artwork "
-                    f"found for **{usable_count} albums**."
+                    f"found for **{usable_count} albums**.  \nAlbum library: "
+                    f"**{usable_count} covers**. Mosaic density: "
+                    f"**{selected_count} requested tiles**."
                 ),
                 gr.update(
-                    minimum=2,
-                    maximum=max(2, album_count),
+                    minimum=DENSITY_MINIMUM,
+                    maximum=density_max,
                     value=selected_count,
                     interactive=usable_count >= 2,
                 ),
-                self.grid_text(
-                    video_path,
-                    selected_count,
-                    prepared,
-                    unique_per_frame,
-                ),
-                gr.update(interactive=bool(video_path) and usable_count >= 2),
+                grid_summary,
+                gr.update(interactive=generation_ready),
                 "### Playlist ready",
                 100,
                 (f"Independent artwork: **{usable_count} / {album_count} albums**"),
@@ -192,10 +218,33 @@ class AlbumosaicUIController:
         ready = playlist is not None and bool(video_path)
         if isinstance(playlist, PreparedPlaylist):
             ready = ready and playlist.usable_album_count >= 2
-        return (
-            self.grid_text(video_path, tile_count, playlist, unique_per_frame),
-            gr.update(interactive=ready),
+        summary = self.grid_text(video_path, tile_count, playlist, unique_per_frame)
+        if summary.startswith("Mosaic grid: unavailable"):
+            ready = False
+        return summary, gr.update(interactive=ready)
+
+    def update_video_readiness(
+        self,
+        video_path: str | None,
+        tile_count: int,
+        playlist: Playlist | PreparedPlaylist | None,
+        unique_per_frame: bool,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Adapt the slider to the uploaded video's safe resolution ceiling."""
+        density_max = self._density_max(video_path)
+        selected_count = min(max(DENSITY_MINIMUM, tile_count), density_max)
+        summary, button = self.update_readiness(
+            video_path, selected_count, playlist, unique_per_frame
         )
+        return summary, button, gr.update(maximum=density_max, value=selected_count)
+
+    def _density_max(self, video_path: str | None) -> int:
+        if not video_path:
+            return DENSITY_MAXIMUM
+        try:
+            return self.workflow.density_limit_for_video(video_path)
+        except Exception:
+            return DENSITY_MAXIMUM
 
     def grid_text(
         self,
@@ -212,23 +261,35 @@ class AlbumosaicUIController:
         except Exception as error:
             return f"Mosaic grid: unavailable ({error})"
         summary = (
-            f"Mosaic grid: approximately **{grid.columns} × {grid.rows}** "
-            f"({grid.tile_count} tiles)"
+            f"Mosaic density: **{tile_count} requested tiles**.  \n"
+            f"Mosaic grid: **{grid.columns} × {grid.rows} = "
+            f"{grid.tile_count} actual tiles**"
         )
         metadata = (
             playlist.playlist if isinstance(playlist, PreparedPlaylist) else playlist
         )
+        usable_count = (
+            playlist.usable_album_count
+            if isinstance(playlist, PreparedPlaylist)
+            else metadata.unique_album_count
+            if metadata is not None
+            else None
+        )
+        if usable_count is not None:
+            summary = f"Album library: **{usable_count} covers**.  \n" + summary
         if (
             unique_per_frame
-            and metadata is not None
-            and grid.tile_count > metadata.unique_album_count
+            and usable_count is not None
+            and grid.tile_count > usable_count
         ):
-            repeats = grid.tile_count - metadata.unique_album_count
+            repeats = grid.tile_count - usable_count
             repeat_label = "repeat" if repeats == 1 else "repeats"
             summary += (
-                f"  \n{metadata.unique_album_count} unique albums available — "
+                f"  \n{usable_count} covers available — "
                 f"up to {repeats} {repeat_label} may be required."
             )
+        if max(tile_count, grid.tile_count) >= HIGH_DENSITY_WARNING_THRESHOLD:
+            summary += "  \nHigh density may significantly increase render time."
         return summary
 
     def generate(

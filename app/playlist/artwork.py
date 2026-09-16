@@ -9,6 +9,7 @@ from hashlib import sha256
 from io import BytesIO
 from json import dumps
 from pathlib import Path
+from stat import S_ISREG
 from tempfile import NamedTemporaryFile
 from threading import Lock
 from time import sleep
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from app.playlist.artwork_sources import ArtworkReference
 
 _DEFAULT_TIMEOUT_SECONDS = 8.0
-_DEFAULT_RETRIES = 2
+_DEFAULT_RETRIES = 1
 _DEFAULT_MAX_WORKERS = 4
 _MAX_WORKERS = 16
 _MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -111,6 +112,7 @@ class ArtworkCache:
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, Lock] = {}
         self._locks_guard = Lock()
+        self._verified_files: dict[Path, tuple[int, int, int, int, int]] = {}
 
     def cache_key(self, album: Album) -> str:
         """Return a stable filesystem-safe key from the album identity."""
@@ -122,7 +124,7 @@ class ArtworkCache:
         cache_key = self._reference_cache_key(album, reference)
         artwork_path = self.artwork_dir / f"{cache_key}.png"
         with self._lock_for(cache_key):
-            if _valid_cached_artwork(artwork_path, self.max_artwork_pixels):
+            if self._valid_cached_artwork(artwork_path):
                 return artwork_path
             if reference.local_path is not None:
                 try:
@@ -157,9 +159,11 @@ class ArtworkCache:
                 _save_image_atomically(image, artwork_path)
                 _save_metadata_atomically(metadata, metadata_path)
             except Exception:
+                self._verified_files.pop(artwork_path, None)
                 artwork_path.unlink(missing_ok=True)
                 metadata_path.unlink(missing_ok=True)
                 raise
+            self._remember_verified_artwork(artwork_path)
             return artwork_path
 
     def cached_path(
@@ -171,9 +175,29 @@ class ArtworkCache:
         cache_key = self._reference_cache_key(album, reference)
         artwork_path = self.artwork_dir / f"{cache_key}.png"
         with self._lock_for(cache_key):
-            if _valid_cached_artwork(artwork_path, self.max_artwork_pixels):
+            if self._valid_cached_artwork(artwork_path):
                 return artwork_path
         return None
+
+    def _valid_cached_artwork(self, path: Path) -> bool:
+        """Reuse a prior full validation while the cached file is unchanged."""
+        fingerprint = _file_fingerprint(path)
+        if fingerprint is None:
+            self._verified_files.pop(path, None)
+            return False
+        if self._verified_files.get(path) == fingerprint:
+            return True
+        valid = _valid_cached_artwork(path, self.max_artwork_pixels)
+        if valid and _file_fingerprint(path) == fingerprint:
+            self._verified_files[path] = fingerprint
+            return True
+        self._verified_files.pop(path, None)
+        return False
+
+    def _remember_verified_artwork(self, path: Path) -> None:
+        fingerprint = _file_fingerprint(path)
+        if fingerprint is not None:
+            self._verified_files[path] = fingerprint
 
     def get_many(
         self,
@@ -313,6 +337,22 @@ def _decode_square_rgb(
         raise ArtworkValidationError(
             f"Pillow could not decode artwork for album {album.album_name}"
         ) from error
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        details = path.stat()
+    except OSError:
+        return None
+    if not S_ISREG(details.st_mode):
+        return None
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
 
 
 def _valid_cached_artwork(path: Path, max_artwork_pixels: int) -> bool:

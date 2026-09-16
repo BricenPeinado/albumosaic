@@ -12,7 +12,12 @@ from uuid import uuid4
 
 from PIL import Image
 
-from app.mosaic.grid import GridSpec, calculate_grid
+from app.mosaic.grid import (
+    MAX_RENDER_DENSITY,
+    GridSpec,
+    calculate_render_grid,
+    maximum_render_density,
+)
 from app.mosaic.matcher import AlbumTile, MatchMode
 from app.mosaic.renderer import validate_blend_alpha
 from app.playlist.artwork_sources import (
@@ -279,7 +284,13 @@ class AlbumosaicWorkflow:
         """Calculate the visible grid from source video metadata."""
         with VideoReader(video_path) as reader:
             metadata = reader.metadata
-        return calculate_grid(metadata.width, metadata.height, tile_count)
+        return calculate_render_grid(metadata.width, metadata.height, tile_count)
+
+    def density_limit_for_video(self, video_path: str | Path) -> int:
+        """Return the current video's adaptive requested-cell ceiling."""
+        with VideoReader(video_path) as reader:
+            metadata = reader.metadata
+        return maximum_render_density(metadata.width, metadata.height)
 
     def generate(
         self,
@@ -295,14 +306,9 @@ class AlbumosaicWorkflow:
         alpha = validate_blend_alpha(blend_alpha)
         if not isinstance(match_mode, MatchMode):
             raise TypeError("match_mode must be a MatchMode")
-        metadata = (
-            playlist.playlist if isinstance(playlist, PreparedPlaylist) else playlist
-        )
-        if metadata.unique_album_count < 2:
-            raise ValueError("A playlist needs at least two unique albums")
-        if not 2 <= tile_count <= metadata.unique_album_count:
+        if not 2 <= tile_count <= MAX_RENDER_DENSITY:
             raise ValueError(
-                "Tile count must be between 2 and the playlist's unique album count"
+                f"Mosaic density must be between 2 and {MAX_RENDER_DENSITY} tiles"
             )
 
         report = progress_reporter or (lambda _progress: None)

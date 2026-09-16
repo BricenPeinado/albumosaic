@@ -60,6 +60,8 @@ def track_item(track_id: str, album_id: str = "album-1") -> dict[str, object]:
             "album": {
                 "id": album_id,
                 "name": "Album",
+                "album_type": "album",
+                "release_date": "2001-01-01",
                 "artists": [{"name": "Artist"}],
                 "images": [{"url": "https://i.scdn.co/forbidden.jpg"}],
                 "external_urls": {
@@ -94,6 +96,8 @@ def test_spotify_resolves_all_pages_deduplicates_and_ignores_images(
     assert len(playlist.tracks) == 2
     assert playlist.unique_album_count == 1
     assert playlist.albums[0].album_id == "album-1"
+    assert playlist.albums[0].album_type == "album"
+    assert playlist.albums[0].release_date == "2001-01-01"
     assert all("/items?" in url for url in requested_urls)
     assert all("scdn.co" not in url for url in requested_urls)
 

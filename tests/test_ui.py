@@ -6,7 +6,7 @@ from threading import Event
 import gradio as gr
 import pytest
 
-from app.mosaic.grid import GridSpec
+from app.mosaic.grid import GridSpec, calculate_grid, maximum_render_density
 from app.mosaic.matcher import MatchMode
 from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
@@ -72,8 +72,11 @@ class _FakeWorkflow:
 
     def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
         assert str(video_path) == "video.mp4"
-        assert tile_count == 3
-        return GridSpec(rows=2, columns=2, tile_count=4)
+        return calculate_grid(1920, 1080, tile_count)
+
+    def density_limit_for_video(self, video_path: str | Path) -> int:
+        assert str(video_path) == "video.mp4"
+        return maximum_render_density(1920, 1080)
 
     def generate(self, *args: object, match_mode: MatchMode, **kwargs: object) -> Path:
         del args, kwargs
@@ -85,14 +88,29 @@ def test_build_interface_returns_blocks() -> None:
     assert isinstance(build_interface(), gr.Blocks)
 
 
-def test_playlist_resolution_enables_density_with_unique_album_maximum() -> None:
+def test_density_slider_has_album_independent_default_and_range() -> None:
+    config = build_interface().get_config_file()
+    density = next(
+        component["props"]
+        for component in config["components"]
+        if component["props"].get("label") == "Mosaic density"
+    )
+
+    assert (density["minimum"], density["maximum"], density["value"]) == (
+        4,
+        1000,
+        200,
+    )
+
+
+def test_playlist_resolution_keeps_density_independent_of_album_count() -> None:
     controller = AlbumosaicUIController(_FakeWorkflow())  # type: ignore[arg-type]
 
     updates = list(
         controller.resolve_playlist(
             "https://open.spotify.com/playlist/abc123",
             "video.mp4",
-            3,
+            200,
             False,
         )
     )
@@ -101,12 +119,48 @@ def test_playlist_resolution_enables_density_with_unique_album_maximum() -> None
     assert final[0].playlist.unique_album_count == 3
     assert final[1] == (
         "Found **3 tracks** across **3 unique albums**.  \n"
-        "Independent artwork found for **3 albums**."
+        "Independent artwork found for **3 albums**.  \n"
+        "Album library: **3 covers**. Mosaic density: **200 requested tiles**."
     )
-    assert final[2]["maximum"] == 3
+    assert final[2]["minimum"] == 4
+    assert final[2]["maximum"] == 3000
+    assert final[2]["value"] == 200
     assert final[2]["interactive"] is True
-    assert final[3] == "Mosaic grid: approximately **2 × 2** (4 tiles)"
+    assert "Album library: **3 covers**" in final[3]
+    assert "Mosaic density: **200 requested tiles**" in final[3]
+    assert "Mosaic grid: **18 × 11 = 198 actual tiles**" in final[3]
     assert final[4]["interactive"] is True
+
+
+def test_video_upload_adapts_slider_maximum_and_clamps_value() -> None:
+    class SmallVideoWorkflow(_FakeWorkflow):
+        def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
+            assert str(video_path) == "small.mp4"
+            return calculate_grid(320, 180, tile_count)
+
+        def density_limit_for_video(self, video_path: str | Path) -> int:
+            assert str(video_path) == "small.mp4"
+            return maximum_render_density(320, 180)
+
+    controller = AlbumosaicUIController(SmallVideoWorkflow())  # type: ignore[arg-type]
+    summary, button, slider = controller.update_video_readiness(
+        "small.mp4", 1500, _playlist(), False
+    )
+
+    assert slider["maximum"] == 880
+    assert slider["value"] == 880
+    assert "40 × 22 = 880 actual tiles" in summary
+    assert button["interactive"] is True
+
+
+def test_high_density_status_warns_about_render_time() -> None:
+    controller = AlbumosaicUIController(_FakeWorkflow())  # type: ignore[arg-type]
+
+    summary = controller.grid_text("video.mp4", 1500, _playlist())
+
+    assert "Mosaic density: **1500 requested tiles**" in summary
+    assert "actual tiles" in summary
+    assert "may significantly increase render time" in summary
 
 
 def test_controller_streams_preparation_progress_before_completion() -> None:
@@ -180,10 +234,24 @@ def test_unique_checkbox_is_passed_to_workflow_as_match_mode() -> None:
 def test_grid_summary_explains_unavoidable_repeats() -> None:
     controller = AlbumosaicUIController(_FakeWorkflow())  # type: ignore[arg-type]
 
-    summary = controller.grid_text("video.mp4", 3, _playlist(), True)
+    summary = controller.grid_text("video.mp4", 200, _playlist(), True)
 
-    assert "4 tiles" in summary
-    assert "up to 1 repeat may be required" in summary
+    assert "actual tiles" in summary
+    assert "up to 195 repeats may be required" in summary
+
+
+def test_video_dimension_limit_disables_generate_until_density_is_lowered() -> None:
+    class TinyVideoWorkflow(_FakeWorkflow):
+        def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
+            del video_path, tile_count
+            raise ValueError("cells must be at least 8 pixels wide and tall")
+
+    controller = AlbumosaicUIController(TinyVideoWorkflow())  # type: ignore[arg-type]
+
+    summary, button = controller.update_readiness("video.mp4", 200, _playlist(), False)
+
+    assert "unavailable" in summary
+    assert button["interactive"] is False
 
 
 def test_checkbox_conversion_defaults_to_nearest() -> None:

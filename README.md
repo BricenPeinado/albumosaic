@@ -26,9 +26,16 @@ available.
 6. Encode the frames as MP4, then use FFmpeg to restore the source audio.
 7. Show progress and expose the result for preview and download in Gradio.
 
-The tile-count control remains disabled until playlist resolution succeeds,
-then ranges from `2` to the number of unique albums. Changing the source video
-or density refreshes an aspect-aware grid estimate.
+The tile-count control remains disabled until playlist resolution succeeds.
+Its initial range is `4` to `1000` requested cells, defaulting to `200`; after
+a video is selected, its maximum adapts to the video's resolution, up to the
+backend hard limit of `3000`. Album library
+size and mosaic density are independent: eight usable covers can reconstruct
+roughly 200 cells, and repeated covers are expected. Changing the source video
+or density refreshes an aspect-aware grid estimate and reports the actual grid
+dimensions and cell count. A high-density status warns that rendering can take
+significantly longer. The backend rejects values above `3000` and high densities
+that would make cells smaller than eight pixels on a small video.
 
 ## Architecture
 
@@ -159,11 +166,22 @@ Set `ALBUMOSAIC_ARTWORK_MANIFEST` to a JSON file for local-first artwork:
 Relative paths are resolved from the manifest directory. `ArtworkCache` uses
 stable album-identity keys, validates HTTP responses and images, stores square
 RGB PNG files, and writes metadata atomically. Valid files are reused.
+Within one running process, a previously validated PNG is not decoded again
+while its device, inode, size, modification time, and change time are unchanged.
+Modified files and files seen by a fresh process receive full Pillow validation.
 
 MusicBrainz requests use a contact-bearing User-Agent and are serialized to at
-most one request per second. Successful album identity mappings are cached;
-unresolved albums are retried on later runs rather than permanently cached as
-failures. Cover Art Archive JSON lookups and artwork downloads may overlap with
+most one request per second. Each album uses at most three bounded searches:
+the full title and primary artist, an edition-suffix-normalized title when
+needed, and a broader title/artist query. Matching also considers artist,
+release year, album type, and MusicBrainz relevance without treating relevance
+as the primary signal. A versioned cache stores confident album-to-MBID
+matches, matching failures, and MBID-to-cover references. Valid cached negative
+matches skip MusicBrainz on later runs. Negative entries are tied to the title,
+primary artist, release year, album type, and confidence setting used to make
+the decision; changing the matching algorithm requires a cache-version bump.
+Missing cover art retains the MBID but can be checked
+again later. Cover Art Archive JSON lookups and artwork downloads may overlap with
 other work, with a four-worker limit. The interactive request timeouts are 7
 seconds for MusicBrainz search, 5 seconds for Cover Art Archive lookup, and 8
 seconds for artwork download. A failed album is skipped while the rest continue.
@@ -177,7 +195,8 @@ is restricted to these service hosts:
 
 Spotify artwork hosts such as `i.scdn.co` are explicitly rejected by the cache.
 
-Downloads use configurable timeouts and retries, a 20 MB response limit, and a
+Downloads use configurable timeouts and one retry by default for transient
+failures, a 20 MB response limit, and a
 bounded thread pool with four workers by default. Playlist parsing remains
 independent from artwork retrieval.
 
@@ -216,10 +235,12 @@ python -m app.main --host 127.0.0.1 --port 7860
 Open the displayed local URL to use the interface. Playlist preparation runs in
 a worker and streams metadata, per-album artwork resolution, download/cache,
 and ready status before enabling density. The page resolves playlists through
-an injected `PlaylistSource`, updates density from the unique-album count,
+an injected `PlaylistSource`, keeps density independent of the album count,
 previews the calculated grid, streams all six generation stages, and exposes
-the completed MP4 for preview and download. Use `--debug` to see per-album
-MusicBrainz, Cover Art Archive, and cache timings without exposing OAuth secrets.
+the completed MP4 for preview and download. Use `--debug` to see Spotify
+metadata time, a MusicBrainz/CAA/artwork-cache timing summary, and video frame
+decode, target-color, matching, composition, and encoding times without
+exposing OAuth secrets.
 
 When `SPOTIFY_CLIENT_ID` is absent, the app starts normally and explains the
 missing setup. Exportify and local artwork remain available.
@@ -342,7 +363,7 @@ comparison and prints the same five timing categories for both implementations.
 
 The UI includes Spotify connection status, Spotify URL and Exportify CSV inputs,
 drag-and-drop video upload,
-playlist-driven mosaic density, an aspect-aware grid estimate, a Generate
+mosaic density independent of playlist size, an aspect-aware grid estimate, a Generate
 control, six-stage progress with percentage and frame counts, and MP4 preview
 and download outputs.
 

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
+from re import compile as re_compile
 from re import sub
 from threading import Lock
 from time import monotonic, perf_counter, sleep
@@ -17,7 +22,12 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request
 
 from app.network import open_url
-from app.playlist.artwork import ArtworkCache, ArtworkCacheError
+from app.playlist.artwork import (
+    ArtworkCache,
+    ArtworkCacheError,
+    ArtworkDownloadError,
+    ArtworkValidationError,
+)
 from app.playlist.models import Album, AlbumKey, deduplicate_albums
 from app.playlist.progress import (
     PreparationProgress,
@@ -29,6 +39,14 @@ _MUSICBRAINZ_HOST = "musicbrainz.org"
 _COVER_ART_HOST = "coverartarchive.org"
 _ARCHIVE_HOSTS = frozenset({_COVER_ART_HOST, "archive.org"})
 _DEFAULT_RESOLUTION_WORKERS = 4
+_MATCH_CACHE_VERSION = 2
+_MAX_MUSICBRAINZ_SEARCHES = 3
+_EDITION_SUFFIX = re_compile(
+    r"(?i)(?:\s*[([]\s*|\s*[-\u2013\u2014]\s*)"
+    r"(?:deluxe(?:\s+edition)?|expanded\s+edition|remaster(?:ed)?"
+    r"(?:\s+\d{4})?|(?:\d+(?:st|nd|rd|th)\s+)?anniversary\s+edition|"
+    r"bonus\s+track\s+version|explicit|clean\s+version)\s*[)\]]?\s*$"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +156,15 @@ class MusicBrainzArtworkResolver:
         self.confidence_threshold = confidence_threshold
         self._lock = Lock()
         self._mapping_lock = Lock()
+        self._timing_lock = Lock()
+        self._mb_calls = 0
+        self._mb_seconds = 0.0
+        self._caa_calls = 0
+        self._caa_seconds = 0.0
         self._last_request = 0.0
-        self._mapping = self._load_mapping()
+        self._mapping, self._reasons, self._contexts, self._cover_refs = (
+            self._load_mapping()
+        )
 
     def resolve(self, album: Album) -> ArtworkReference | None:
         label = _album_label(album)
@@ -147,73 +172,135 @@ class MusicBrainzArtworkResolver:
         with self._mapping_lock:
             mapping_cached = key in self._mapping
             cached_mbid = self._mapping.get(key)
+            cached_reason = self._reasons.get(key)
+            cached_context = self._contexts.get(key)
+            cached_cover = self._cover_refs.get(cached_mbid or "")
+        if (
+            mapping_cached
+            and cached_mbid is None
+            and cached_context != self._match_context(album)
+        ):
+            mapping_cached = False
+            logger.debug("MusicBrainz mapping cache: stale negative")
         if mapping_cached:
             logger.debug("%s\nMusicBrainz mapping cache: HIT", label)
             if cached_mbid is None:
-                logger.debug("unresolved")
+                logger.debug("%s: cached negative", cached_reason or "low_confidence")
                 return None
-            logger.debug("CAA lookup: cached")
-            logger.debug("resolved")
-            return _cover_art_reference(cached_mbid)
-
-        logger.debug("%s\nMusicBrainz mapping cache: MISS", label)
-
-        artist = " ".join(album.artists)
-        query = (
-            f'releasegroup:"{_lucene(album.album_name)}" AND artist:"{_lucene(artist)}"'
-        )
-        url = f"https://{_MUSICBRAINZ_HOST}/ws/2/release-group/?" + urlencode(
-            {"query": query, "fmt": "json", "limit": 10}
-        )
-        search_started = perf_counter()
-        try:
-            payload = self._get_json(url)
-        except ArtworkResolutionError as error:
-            logger.debug(
-                "MusicBrainz: %s after %.2fs",
-                error,
-                perf_counter() - search_started,
-            )
-            logger.debug("skipped")
-            raise
-        logger.debug("MusicBrainz: %.2fs", perf_counter() - search_started)
-        candidates = payload.get("release-groups")
-        if not isinstance(candidates, list):
-            raise ArtworkResolutionError("MusicBrainz returned invalid search results")
-        ranked = sorted(
-            (
-                (_candidate_score(album, candidate), candidate)
-                for candidate in candidates
-                if isinstance(candidate, dict)
-            ),
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-        if not ranked or ranked[0][0] < self.confidence_threshold:
-            self._remember(key, None)
-            return None
-        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 5:
-            self._remember(key, None)
-            return None
-        mbid = ranked[0][1].get("id")
-        if not isinstance(mbid, str) or not mbid:
-            self._remember(key, None)
-            return None
+            if cached_cover is not None:
+                logger.debug("CAA cover-reference cache: HIT")
+                return _cover_art_reference(cached_mbid, cached_cover)
+            logger.debug("CAA cover-reference cache: MISS")
+            mbid = cached_mbid
+        else:
+            logger.debug("%s\nMusicBrainz mapping cache: MISS", label)
+            found_mbid = self._search_album(album, key)
+            if found_mbid is None:
+                return None
+            mbid = found_mbid
         cover_started = perf_counter()
         try:
             reference = self._cover_reference(mbid)
         except ArtworkResolutionError as error:
             logger.debug(
-                "CAA lookup: %s after %.2fs",
+                "cover_lookup_error: %s after %.2fs",
                 error,
                 perf_counter() - cover_started,
             )
-            logger.debug("skipped")
             raise
+        finally:
+            self._record_service_timing("caa", perf_counter() - cover_started)
         logger.debug("CAA lookup: %.2fs", perf_counter() - cover_started)
-        self._remember(key, mbid if reference is not None else None)
-        logger.debug("resolved" if reference is not None else "unresolved")
+        if reference is None:
+            logger.debug("no_cover_art: %s", label)
+            self._remember(key, mbid, reason="no_cover_art")
+        else:
+            self._remember(key, mbid, cover_url=reference.url)
         return reference
+
+    def _search_album(self, album: Album, key: str) -> str | None:
+        candidates_by_id: dict[str, dict[str, object]] = {}
+        seen_queries: set[str] = set()
+        for stage, query in enumerate(_search_queries(album), start=1):
+            if query in seen_queries:
+                continue
+            seen_queries.add(query)
+            url = f"https://{_MUSICBRAINZ_HOST}/ws/2/release-group/?" + urlencode(
+                {"query": query, "fmt": "json", "limit": 10}
+            )
+            started = perf_counter()
+            try:
+                payload = self._get_json(url)
+            except ArtworkResolutionError as error:
+                logger.debug(
+                    "MusicBrainz search %d: %s after %.2fs",
+                    stage,
+                    error,
+                    perf_counter() - started,
+                )
+                raise
+            finally:
+                self._record_service_timing("mb", perf_counter() - started)
+            logger.debug(
+                "MusicBrainz search %d: %.2fs", stage, perf_counter() - started
+            )
+            results = payload.get("release-groups")
+            if not isinstance(results, list):
+                raise ArtworkResolutionError(
+                    "MusicBrainz returned invalid search results"
+                )
+            for item in results:
+                if isinstance(item, dict):
+                    mbid = item.get("id")
+                    if isinstance(mbid, str) and mbid:
+                        candidates_by_id[mbid] = item
+            winner, reason = _select_candidate(
+                album, candidates_by_id.values(), self.confidence_threshold
+            )
+            if winner is not None:
+                mbid = winner["id"]
+                assert isinstance(mbid, str)
+                self._remember(key, mbid)
+                return mbid
+            logger.debug("MusicBrainz search %d: %s", stage, reason)
+
+        _, reason = _select_candidate(
+            album, candidates_by_id.values(), self.confidence_threshold
+        )
+        logger.debug("%s: %s", reason, _album_label(album))
+        self._remember(
+            key, None, reason=reason, match_context=self._match_context(album)
+        )
+        return None
+
+    def _match_context(self, album: Album) -> str:
+        values = (
+            _normalize(album.album_name),
+            _normalize(album.artists[0]) if album.artists else "",
+            str(_year(album.release_date) or ""),
+            (album.album_type or "album").casefold(),
+            str(self.confidence_threshold),
+        )
+        return sha256("\x1f".join(values).encode("utf-8")).hexdigest()
+
+    def service_timing_snapshot(self) -> tuple[int, float, int, float]:
+        """Return cumulative request counts and wall times for diagnostics."""
+        with self._timing_lock:
+            return (
+                self._mb_calls,
+                self._mb_seconds,
+                self._caa_calls,
+                self._caa_seconds,
+            )
+
+    def _record_service_timing(self, service: str, elapsed: float) -> None:
+        with self._timing_lock:
+            if service == "mb":
+                self._mb_calls += 1
+                self._mb_seconds += elapsed
+            else:
+                self._caa_calls += 1
+                self._caa_seconds += elapsed
 
     def _cover_reference(self, mbid: str) -> ArtworkReference | None:
         url = f"https://{_COVER_ART_HOST}/release-group/{quote(mbid)}"
@@ -287,34 +374,109 @@ class MusicBrainzArtworkResolver:
             raise ArtworkResolutionError("MusicBrainz returned invalid JSON")
         return cast(dict[str, object], decoded)
 
-    def _load_mapping(self) -> dict[str, str | None]:
+    def _load_mapping(
+        self,
+    ) -> tuple[dict[str, str | None], dict[str, str], dict[str, str], dict[str, str]]:
         if not self.cache_path.is_file():
-            return {}
+            return {}, {}, {}, {}
         try:
             decoded = loads(self.cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {}
+            return {}, {}, {}, {}
         if not isinstance(decoded, dict):
-            return {}
-        return {
-            str(key): value
-            for key, value in decoded.items()
-            if isinstance(value, str) and value
-        }
+            return {}, {}, {}, {}
+        if decoded.get("version") != _MATCH_CACHE_VERSION:
+            # Legacy positive mappings are useful; legacy nulls predate this strategy.
+            if "version" in decoded:
+                return {}, {}, {}, {}
+            positives: dict[str, str | None] = {
+                str(key): value
+                for key, value in decoded.items()
+                if isinstance(value, str) and value
+            }
+            return positives, {}, {}, {}
+        raw_entries = decoded.get("entries")
+        raw_covers = decoded.get("covers")
+        if not isinstance(raw_entries, dict):
+            return {}, {}, {}, {}
+        mapping: dict[str, str | None] = {}
+        reasons: dict[str, str] = {}
+        contexts: dict[str, str] = {}
+        for key, entry in raw_entries.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            mbid = entry.get("mbid")
+            if mbid is not None and (not isinstance(mbid, str) or not mbid):
+                continue
+            reason = entry.get("reason")
+            context = entry.get("match_context")
+            if mbid is None and reason not in {
+                "no_musicbrainz_results",
+                "low_confidence",
+                "ambiguous_match",
+            }:
+                continue
+            if mbid is None and not isinstance(context, str):
+                continue
+            mapping[key] = mbid
+            if isinstance(reason, str):
+                reasons[key] = reason
+            if isinstance(context, str):
+                contexts[key] = context
+        covers: dict[str, str] = {}
+        if isinstance(raw_covers, dict):
+            for mbid, url in raw_covers.items():
+                if isinstance(mbid, str) and isinstance(url, str):
+                    try:
+                        _cover_art_reference(mbid, url)
+                    except ArtworkResolutionError:
+                        continue
+                    covers[mbid] = url
+        return mapping, reasons, contexts, covers
 
-    def _remember(self, key: str, mbid: str | None) -> None:
+    def _remember(
+        self,
+        key: str,
+        mbid: str | None,
+        *,
+        reason: str | None = None,
+        cover_url: str | None = None,
+        match_context: str | None = None,
+    ) -> None:
         with self._mapping_lock:
-            if mbid is None:
-                self._mapping.pop(key, None)
+            self._mapping[key] = mbid
+            if reason is None:
+                self._reasons.pop(key, None)
             else:
-                self._mapping[key] = mbid
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.cache_path.with_suffix(".tmp")
+                self._reasons[key] = reason
+            if match_context is None:
+                self._contexts.pop(key, None)
+            else:
+                self._contexts[key] = match_context
+            if mbid is not None and cover_url is not None:
+                self._cover_refs[mbid] = cover_url
             try:
-                temporary.write_text(dumps(self._mapping, indent=2), encoding="utf-8")
+                self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.cache_path.with_suffix(".tmp")
+                payload = {
+                    "version": _MATCH_CACHE_VERSION,
+                    "entries": {
+                        identity: {
+                            "mbid": value,
+                            "reason": self._reasons.get(identity),
+                            "match_context": self._contexts.get(identity),
+                        }
+                        for identity, value in self._mapping.items()
+                    },
+                    "covers": self._cover_refs,
+                }
+                temporary.write_text(dumps(payload, indent=2), encoding="utf-8")
                 temporary.replace(self.cache_path)
+            except OSError as error:
+                logger.debug("MusicBrainz cache write failed: %s", error)
             finally:
-                temporary.unlink(missing_ok=True)
+                with suppress(OSError):
+                    self.cache_path.with_suffix(".tmp").unlink(missing_ok=True)
 
 
 class IndependentArtworkProvider:
@@ -338,6 +500,11 @@ class IndependentArtworkProvider:
         report = progress_reporter or (lambda _progress: None)
         unique_albums = deduplicate_albums(albums)
         total = len(unique_albums)
+        service_baselines = {
+            resolver: resolver.service_timing_snapshot()
+            for resolver in self.resolvers
+            if isinstance(resolver, MusicBrainzArtworkResolver)
+        }
         resolution_started = perf_counter()
         selected_by_index: dict[int, tuple[Album, ArtworkReference]] = {}
         with ThreadPoolExecutor(
@@ -421,6 +588,18 @@ class IndependentArtworkProvider:
             total - len(results),
             total,
         )
+        for resolver, baseline in service_baselines.items():
+            current = resolver.service_timing_snapshot()
+            logger.debug(
+                "Artwork service timing: MusicBrainz %d searches / %.3fs cumulative; "
+                "CAA %d metadata lookups / %.3fs cumulative; "
+                "artwork download/cache %.3fs wall",
+                current[0] - baseline[0],
+                current[1] - baseline[1],
+                current[2] - baseline[2],
+                current[3] - baseline[3],
+                download_elapsed,
+            )
         return results
 
     def _resolve_one(
@@ -463,52 +642,161 @@ class IndependentArtworkProvider:
             return ResolvedArtwork(album, cached), True, perf_counter() - started
         try:
             result = ResolvedArtwork(album, self.cache.get(album, reference))
-        except (ArtworkCacheError, OSError):
+        except ArtworkValidationError as error:
+            logger.debug("artwork_validation_error: %s: %s", _album_label(album), error)
+            result = None
+        except (ArtworkDownloadError, OSError) as error:
+            logger.debug("artwork_download_error: %s: %s", _album_label(album), error)
+            result = None
+        except ArtworkCacheError as error:
+            logger.debug("artwork_download_error: %s: %s", _album_label(album), error)
             result = None
         return result, False, perf_counter() - started
 
 
-def _candidate_score(album: Album, candidate: dict[object, object]) -> float:
+def _search_queries(album: Album) -> tuple[str, ...]:
+    primary_artist = album.artists[0] if album.artists else ""
+    full_title = album.album_name.strip()
+    fallback_title = _edition_title(full_title)
+    exact = (
+        f'releasegroup:"{_lucene(full_title)}" AND artist:"{_lucene(primary_artist)}"'
+    )
+    queries = [exact]
+    if _normalize(fallback_title) != _normalize(full_title):
+        queries.append(
+            f'releasegroup:"{_lucene(fallback_title)}" AND '
+            f'artist:"{_lucene(primary_artist)}"'
+        )
+    queries.append(
+        f"releasegroup:({_lucene(fallback_title)}) AND "
+        f"artist:({_lucene(primary_artist)})"
+    )
+    return tuple(queries[:_MAX_MUSICBRAINZ_SEARCHES])
+
+
+def _select_candidate(
+    album: Album,
+    candidates: Iterable[dict[str, object]],
+    confidence_threshold: float,
+) -> tuple[dict[str, object] | None, str]:
+    ranked = sorted(
+        ((_candidate_score(album, candidate), candidate) for candidate in candidates),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if not ranked:
+        return None, "no_musicbrainz_results"
+    if ranked[0][0] < confidence_threshold:
+        return None, "low_confidence"
+    if (
+        len(ranked) > 1
+        and ranked[0][0] - ranked[1][0] < 5
+        and not _same_effective_album(ranked[0][1], ranked[1][1])
+    ):
+        return None, "ambiguous_match"
+    return ranked[0][1], "resolved"
+
+
+def _candidate_score(album: Album, candidate: dict[str, object]) -> float:
     title = candidate.get("title")
     if not isinstance(title, str):
         return 0.0
-    artist_credit = candidate.get("artist-credit")
-    candidate_artists: list[str] = []
-    if isinstance(artist_credit, list):
-        for credit in artist_credit:
+    target_title = _normalize(album.album_name)
+    candidate_title = _normalize(title)
+    if title == album.album_name:
+        score = 40.0
+    elif candidate_title == target_title:
+        score = 36.0
+    elif _normalize(_edition_title(title)) == _normalize(
+        _edition_title(album.album_name)
+    ):
+        score = 32.0
+    else:
+        score = 34.0 * SequenceMatcher(None, target_title, candidate_title).ratio()
+
+    primary_artist = album.artists[0] if album.artists else ""
+    candidate_artist = _candidate_artist(candidate)
+    target_artist = _normalize(primary_artist)
+    matched_artist = _normalize(candidate_artist)
+    if candidate_artist == primary_artist:
+        score += 35.0
+    elif matched_artist == target_artist:
+        score += 32.0
+    else:
+        score += 32.0 * SequenceMatcher(None, target_artist, matched_artist).ratio()
+
+    album_type = (album.album_type or "album").casefold()
+    primary_type = candidate.get("primary-type")
+    if isinstance(primary_type, str):
+        if primary_type.casefold() == album_type:
+            score += 8.0
+        elif album_type == "compilation" and primary_type.casefold() == "album":
+            secondary = candidate.get("secondary-types")
+            if isinstance(secondary, list) and "Compilation" in secondary:
+                score += 8.0
+        else:
+            score -= 5.0
+
+    target_year = _year(album.release_date)
+    candidate_year = _year(candidate.get("first-release-date"))
+    if target_year is not None and candidate_year is not None:
+        difference = abs(target_year - candidate_year)
+        score += (
+            10.0
+            if difference == 0
+            else 7.0
+            if difference == 1
+            else 4.0
+            if difference <= 3
+            else -10.0
+        )
+
+    api_score = candidate.get("score")
+    if isinstance(api_score, int):
+        score += max(0, min(api_score, 100)) / 25
+    return score
+
+
+def _candidate_artist(candidate: dict[str, object]) -> str:
+    credits = candidate.get("artist-credit")
+    if isinstance(credits, list):
+        for credit in credits:
             if isinstance(credit, dict):
                 name = credit.get("name")
                 if isinstance(name, str):
-                    candidate_artists.append(name)
-    artist = " ".join(album.artists)
-    candidate_artist = " ".join(candidate_artists)
-    score = (
-        45.0
-        if title == album.album_name
-        else 35.0
-        if _normalize(title) == _normalize(album.album_name)
-        else 0.0
+                    return name
+    return ""
+
+
+def _same_effective_album(left: dict[str, object], right: dict[str, object]) -> bool:
+    left_title = left.get("title")
+    right_title = right.get("title")
+    left_year = _year(left.get("first-release-date"))
+    right_year = _year(right.get("first-release-date"))
+    return (
+        isinstance(left_title, str)
+        and isinstance(right_title, str)
+        and _normalize(_edition_title(left_title))
+        == _normalize(_edition_title(right_title))
+        and _normalize(_candidate_artist(left)) == _normalize(_candidate_artist(right))
+        and left_year is not None
+        and left_year == right_year
     )
-    score += (
-        40.0
-        if candidate_artist == artist
-        else 30.0
-        if _normalize(candidate_artist) == _normalize(artist)
-        else 0.0
-    )
-    if candidate.get("primary-type") == "Album":
-        score += 10.0
-    first_release_date = candidate.get("first-release-date")
-    if (
-        album.release_date
-        and isinstance(first_release_date, str)
-        and first_release_date[:4] == album.release_date[:4]
-    ):
-        score += 3.0
-    api_score = candidate.get("score")
-    if isinstance(api_score, int):
-        score += max(0, min(api_score, 100)) / 20
-    return score
+
+
+def _edition_title(title: str) -> str:
+    cleaned = title.strip()
+    while True:
+        shorter = _EDITION_SUFFIX.sub("", cleaned).strip()
+        if shorter == cleaned or not shorter:
+            return cleaned
+        cleaned = shorter
+
+
+def _year(value: object) -> int | None:
+    if isinstance(value, str) and len(value) >= 4 and value[:4].isdigit():
+        return int(value[:4])
+    return None
 
 
 def _normalize(value: str) -> str:

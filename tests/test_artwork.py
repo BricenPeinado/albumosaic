@@ -130,6 +130,65 @@ def test_valid_cached_artwork_is_never_redownloaded(
     assert calls == 1
 
 
+def test_warm_cached_path_skips_repeat_decode_but_revalidates_modified_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = remote_reference()
+    album = make_album()
+    monkeypatch.setattr(
+        artwork,
+        "open_url",
+        lambda request, timeout: FakeResponse(image_bytes()),
+    )
+    cache = ArtworkCache(tmp_path)
+    path = cache.get(album, reference)
+    validations = 0
+    original_validator = artwork._valid_cached_artwork
+
+    def count_validation(candidate: Path, max_pixels: int) -> bool:
+        nonlocal validations
+        validations += 1
+        return original_validator(candidate, max_pixels)
+
+    monkeypatch.setattr(artwork, "_valid_cached_artwork", count_validation)
+    assert cache.cached_path(album, reference) == path
+    assert cache.cached_path(album, reference) == path
+    assert validations == 0
+
+    path.write_bytes(b"corrupt artwork")
+    assert cache.cached_path(album, reference) is None
+    assert validations == 1
+
+
+def test_fresh_artwork_cache_instance_validates_existing_png(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = remote_reference()
+    album = make_album()
+    monkeypatch.setattr(
+        artwork,
+        "open_url",
+        lambda request, timeout: FakeResponse(image_bytes()),
+    )
+    first = ArtworkCache(tmp_path)
+    path = first.get(album, reference)
+    second = ArtworkCache(tmp_path)
+    validations = 0
+    original_validator = artwork._valid_cached_artwork
+
+    def count_validation(candidate: Path, max_pixels: int) -> bool:
+        nonlocal validations
+        validations += 1
+        return original_validator(candidate, max_pixels)
+
+    monkeypatch.setattr(artwork, "_valid_cached_artwork", count_validation)
+    assert second.cached_path(album, reference) == path
+    assert second.cached_path(album, reference) == path
+    assert validations == 1
+
+
 def test_cache_key_uses_normalized_fallback_without_album_id(tmp_path: Path) -> None:
     cache = ArtworkCache(tmp_path)
     first = make_album(None, album_name="  HOME ", artist="THE ARTIST")
@@ -157,6 +216,26 @@ def test_transient_download_failures_are_retried(
 
     assert cache.get(make_album(), remote_reference()).is_file()
     assert attempts == 3
+
+
+def test_default_artwork_retry_is_one_for_transient_http_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def flaky_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal attempts
+        del request, timeout
+        attempts += 1
+        return FakeResponse(image_bytes(), status=503 if attempts == 1 else 200)
+
+    monkeypatch.setattr(artwork, "open_url", flaky_open)
+    cache = ArtworkCache(tmp_path, retry_backoff=0)
+
+    assert cache.retries == 1
+    assert cache.get(make_album(), remote_reference()).is_file()
+    assert attempts == 2
 
 
 @pytest.mark.parametrize(

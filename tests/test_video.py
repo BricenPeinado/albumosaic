@@ -1,5 +1,6 @@
 """Integration tests for streaming silent mosaic video rendering."""
 
+import logging
 from pathlib import Path
 from shutil import which
 
@@ -65,6 +66,7 @@ def test_reader_reports_metadata_and_streams_frames(tmp_path: Path) -> None:
 
 def test_render_video_preserves_geometry_timing_and_reports_progress(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     input_path = tmp_path / "input.avi"
     output_path = tmp_path / "mosaic.mp4"
@@ -76,14 +78,17 @@ def test_render_video_preserves_geometry_timing_and_reports_progress(
     progress: list[tuple[int, int]] = []
     timings: list[VideoRenderTiming] = []
 
-    result = render_video(
-        input_path,
-        album_tiles,
-        tile_count=2,
-        output_path=output_path,
-        progress_callback=lambda processed, total: progress.append((processed, total)),
-        timing_callback=timings.append,
-    )
+    with caplog.at_level(logging.DEBUG, logger="app.video.renderer"):
+        result = render_video(
+            input_path,
+            album_tiles,
+            tile_count=2,
+            output_path=output_path,
+            progress_callback=lambda processed, total: progress.append(
+                (processed, total)
+            ),
+            timing_callback=timings.append,
+        )
 
     assert result == output_path
     assert output_path.is_file()
@@ -96,6 +101,9 @@ def test_render_video_preserves_geometry_timing_and_reports_progress(
     assert timings[0].frame_count == 4
     assert timings[0].total_seconds > 0
     assert "target color calculation" in timings[0].format()
+    assert "matching" in caplog.text
+    assert "composition" in caplog.text
+    assert "frame encoding" in caplog.text
     with VideoReader(output_path) as reader:
         assert reader.metadata.width == 32
         assert reader.metadata.height == 18

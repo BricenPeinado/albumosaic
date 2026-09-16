@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+from app import network
 from app.mosaic.matcher import AlbumTile, AlbumTileCache, MatchMode
 from app.mosaic.renderer import MosaicRenderPlan, blend_uint8_frames, render_mosaic
 
@@ -36,6 +37,97 @@ def test_render_mosaic_reuses_explicit_tile_cache() -> None:
 
     assert cache.get("album-0", albums[0]) is first_tile
     assert len(cache) == 1
+
+
+@pytest.mark.parametrize(("album_count", "requested"), [(8, 200), (3, 100)])
+def test_many_cells_match_a_small_album_library_without_tile_duplication(
+    album_count: int, requested: int
+) -> None:
+    images = [
+        Image.new("RGB", (20, 20), (index * 25, index * 25, index * 25))
+        for index in range(album_count)
+    ]
+    cache = AlbumTileCache()
+    tiles = cache.get_many(images)
+    plan = MosaicRenderPlan(320, 180, tiles, requested, MatchMode.NEAREST)
+    target_means = np.zeros((plan.grid.tile_count, 3), dtype=np.float32)
+
+    matches = plan.match(target_means)
+    rendered = render_mosaic(
+        Image.new("RGB", (320, 180), "black"),
+        images,
+        requested,
+        tile_cache=cache,
+    )
+
+    assert len(matches) == plan.grid.tile_count
+    assert set(matches.tolist()) <= set(range(album_count))
+    assert len(set(matches.tolist())) < len(matches)
+    assert len(plan.album_tiles) == album_count
+    assert all(plan.album_tiles[index] is tiles[index] for index in range(album_count))
+    assert plan.album_index.vectors.shape == (album_count, 3)
+    assert len(cache) == album_count
+    assert rendered.size == (320, 180)
+
+
+def test_high_density_render_reuses_three_album_tiles() -> None:
+    tiles = tuple(
+        AlbumTile(str(index), Image.new("RGB", (24, 24), (index * 80, 0, 0)))
+        for index in range(3)
+    )
+    plan = MosaicRenderPlan(640, 360, tiles, 1500, MatchMode.NEAREST)
+    target_means = np.zeros((plan.grid.tile_count, 3), dtype=np.float32)
+    matches = plan.match(target_means)
+
+    result = plan.compose_bgr(matches)
+
+    assert plan.grid.tile_count > 500
+    assert len(matches) == plan.grid.tile_count
+    assert set(matches.tolist()) <= {0, 1, 2}
+    assert len(plan.album_tiles) == 3
+    assert result.shape == (360, 640, 3)
+    assert result.dtype == np.uint8
+
+
+def test_unique_mode_fills_overflow_cells_without_reducing_density() -> None:
+    tiles = tuple(
+        AlbumTile(str(index), Image.new("RGB", (20, 20), (index * 30, 0, 0)))
+        for index in range(8)
+    )
+    plan = MosaicRenderPlan(320, 180, tiles, 200, MatchMode.UNIQUE_PER_FRAME)
+    target_means = np.zeros((plan.grid.tile_count, 3), dtype=np.float32)
+
+    matches = plan.match(target_means)
+
+    assert len(matches) == plan.grid.tile_count
+    assert set(matches.tolist()) == set(range(8))
+    assert len(set(matches.tolist())) < len(matches)
+    assert plan.grid.tile_count > len(tiles)
+
+
+def test_repeated_frame_rendering_uses_cached_features_and_no_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        network,
+        "open_url",
+        lambda request, timeout: pytest.fail("rendering attempted network I/O"),
+    )
+    tiles = tuple(
+        AlbumTile(str(index), Image.new("RGB", (20, 20), (index * 30, 0, 0)))
+        for index in range(8)
+    )
+    plan = MosaicRenderPlan(320, 180, tiles, 200)
+    frame = np.zeros((180, 320, 3), dtype=np.uint8)
+    first = plan.render_bgr(frame)
+    cached_variants = tuple(len(tile.resized_tile_cache) for tile in tiles)
+    first_bgr_variants = len(plan._bgr_tile_cache)
+
+    assert np.array_equal(plan.render_bgr(frame), first)
+    assert tuple(len(tile.resized_tile_cache) for tile in tiles) == cached_variants
+    assert len(plan._bgr_tile_cache) == first_bgr_variants
+    assert len(plan.album_tiles) == len(tiles)
+    assert plan.album_index.vectors.shape == (len(tiles), 3)
 
 
 def test_render_plan_keeps_match_mode_as_frame_invariant_configuration() -> None:

@@ -206,6 +206,7 @@ def _map_playlist_item(raw_item: object) -> Track | None:
         artists=album_artists,
         source_url=_spotify_external_url(album_data),
         release_date=_text(album_data.get("release_date")),
+        album_type=_text(album_data.get("album_type")),
     )
     external_ids = item.get("external_ids")
     return Track(

@@ -16,6 +16,7 @@ class Album:
     artists: tuple[str, ...]
     source_url: str | None
     release_date: str | None = None
+    album_type: str | None = None
 
     @property
     def identity_key(self) -> AlbumKey:

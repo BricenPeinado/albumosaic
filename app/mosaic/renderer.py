@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from app.mosaic.grid import GridSpec, calculate_grid
+from app.mosaic.grid import GridSpec, calculate_render_grid
 from app.mosaic.matcher import (
     AlbumLabIndex,
     AlbumTile,
@@ -43,7 +43,7 @@ class MosaicRenderPlan:
         if not isinstance(match_mode, MatchMode):
             raise TypeError("match_mode must be a MatchMode")
         self.match_mode = match_mode
-        self.grid: GridSpec = calculate_grid(width, height, target_tile_count)
+        self.grid: GridSpec = calculate_render_grid(width, height, target_tile_count)
         self.album_index = AlbumLabIndex.from_tiles(self.album_tiles)
         self.x_edges = np.linspace(0, width, self.grid.columns + 1, dtype=np.intp)
         self.y_edges = np.linspace(0, height, self.grid.rows + 1, dtype=np.intp)
@@ -135,7 +135,7 @@ def render_mosaic(
     if not album_images:
         raise ValueError("At least one album image is required")
 
-    grid = calculate_grid(
+    grid = calculate_render_grid(
         width=target_image.width,
         height=target_image.height,
         target_tile_count=target_tile_count,

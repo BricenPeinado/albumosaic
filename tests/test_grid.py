@@ -2,7 +2,13 @@
 
 import pytest
 
-from app.mosaic.grid import GridSpec, calculate_grid, choose_grid
+from app.mosaic.grid import (
+    GridSpec,
+    calculate_grid,
+    calculate_render_grid,
+    choose_grid,
+    maximum_render_density,
+)
 
 
 def test_16_by_9_grid_favors_columns() -> None:
@@ -88,6 +94,43 @@ def test_compatibility_wrapper_uses_width_height_order() -> None:
         columns=2,
         tile_count=2,
     )
+
+
+def test_render_grid_density_uses_dimensions_not_album_count() -> None:
+    grid = calculate_render_grid(320, 180, 200)
+
+    assert grid == GridSpec(rows=11, columns=18, tile_count=198)
+
+
+def test_render_grid_rejects_subthumbnail_cells_on_tiny_video() -> None:
+    with pytest.raises(ValueError, match="cannot exceed 8 tiles"):
+        calculate_render_grid(32, 18, 200)
+
+
+def test_render_grid_accepts_density_above_500() -> None:
+    grid = calculate_render_grid(640, 360, 1500)
+
+    assert grid == GridSpec(rows=29, columns=52, tile_count=1508)
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [(1920, 1080, 3000), (640, 360, 3000), (320, 180, 880), (32, 18, 8)],
+)
+def test_adaptive_density_maximum_uses_video_resolution(
+    width: int, height: int, expected: int
+) -> None:
+    assert maximum_render_density(width, height) == expected
+
+
+def test_render_grid_limits_requested_density_to_backend_cap() -> None:
+    with pytest.raises(ValueError, match="cannot exceed 3000"):
+        calculate_render_grid(1920, 1080, 3001)
+
+
+def test_render_grid_enforces_resolution_specific_cap() -> None:
+    with pytest.raises(ValueError, match="cannot exceed 880"):
+        calculate_render_grid(320, 180, 881)
 
 
 def test_grid_spec_rejects_inconsistent_tile_count() -> None:

@@ -4,7 +4,13 @@ from typing import cast
 
 import gradio as gr
 
-from app.ui.controller import AlbumosaicUIController, format_blend_percentage
+from app.ui.controller import (
+    DENSITY_DEFAULT,
+    DENSITY_MAXIMUM,
+    DENSITY_MINIMUM,
+    AlbumosaicUIController,
+    format_blend_percentage,
+)
 from app.workflow import AlbumosaicWorkflow
 
 CSS = """
@@ -69,21 +75,24 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
                 )
 
                 density = gr.Slider(
-                    minimum=2,
-                    maximum=3,
-                    value=2,
+                    minimum=DENSITY_MINIMUM,
+                    maximum=DENSITY_MAXIMUM,
+                    value=DENSITY_DEFAULT,
                     step=1,
                     label="Mosaic density",
-                    info="Number of album-cover tiles visible in each frame.",
+                    info=(
+                        "Requested mosaic cells per frame; albums may repeat. "
+                        "Higher values can increase render time."
+                    ),
                     interactive=False,
                 )
                 unique_per_frame = gr.Checkbox(
                     value=False,
-                    label="Don't repeat albums in the same frame",
+                    label="Use unique albums where possible",
                     info=(
-                        "Try to use every album only once per frame. This can "
-                        "increase variety but may make the mosaic slightly less "
-                        "color-accurate."
+                        "Use each album once where possible; cells beyond the "
+                        "album library still repeat. This can increase variety "
+                        "but may reduce color accuracy."
                     ),
                 )
                 grid_summary = gr.Markdown(
@@ -160,9 +169,9 @@ def build_interface(workflow: AlbumosaicWorkflow | None = None) -> gr.Blocks:
             outputs=spotify_status,
         )
         source_video.change(
-            fn=controller.update_readiness,
+            fn=controller.update_video_readiness,
             inputs=[source_video, density, playlist_state, unique_per_frame],
-            outputs=[grid_summary, generate],
+            outputs=[grid_summary, generate, density],
         )
         density.change(
             fn=controller.update_readiness,

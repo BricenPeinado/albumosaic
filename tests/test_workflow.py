@@ -1,5 +1,6 @@
 """Tests for provider-neutral UI workflow orchestration."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,39 @@ def test_generate_reports_all_stages_and_frame_progress(tmp_path: Path) -> None:
     assert progress[-1] == WorkflowProgress(WorkflowStage.FINISHED, 100)
 
 
+def test_workflow_accepts_density_far_above_usable_album_count(tmp_path: Path) -> None:
+    artwork_paths = (tmp_path / "one.png", tmp_path / "two.png")
+    for path in artwork_paths:
+        Image.new("RGB", (12, 12), "red").save(path)
+    observed: list[tuple[int, int]] = []
+
+    def fake_renderer(
+        input_path: str | Path,
+        album_tiles: tuple,
+        tile_count: int,
+        output_path: Path,
+        **kwargs: object,
+    ) -> Path:
+        del input_path, kwargs
+        observed.append((len(album_tiles), tile_count))
+        output_path.write_bytes(b"mp4")
+        return output_path
+
+    workflow = AlbumosaicWorkflow(
+        playlist_source=_PlaylistSource(_playlist()),
+        artwork_provider=_ArtworkProvider(artwork_paths),
+        video_renderer=fake_renderer,
+        output_dir=tmp_path / "output",
+    )
+    prepared = workflow.prepare_artwork(_playlist())
+
+    assert workflow.generate(prepared, "input.mp4", 1500).is_file()
+    assert observed == [(2, 1500)]
+
+    with pytest.raises(ValueError, match="between 2 and 3000"):
+        workflow.generate(prepared, "input.mp4", 3001)
+
+
 def test_default_source_uses_spotify_only_when_configured(
     monkeypatch,
 ) -> None:
@@ -218,6 +252,7 @@ def test_exportify_uses_the_same_independent_artwork_provider(tmp_path: Path) ->
 
 def test_playlist_preparation_reports_metadata_artwork_and_ready(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     playlist = _playlist()
     artwork_paths = (tmp_path / "one.png", tmp_path / "two.png")
@@ -227,7 +262,8 @@ def test_playlist_preparation_reports_metadata_artwork_and_ready(
     )
     progress: list[PreparationProgress] = []
 
-    prepared = workflow.prepare_playlist("playlist-input", progress.append)
+    with caplog.at_level(logging.DEBUG, logger="app.workflow"):
+        prepared = workflow.prepare_playlist("playlist-input", progress.append)
 
     assert prepared.usable_album_count == 2
     assert [update.stage for update in progress] == [
@@ -237,3 +273,4 @@ def test_playlist_preparation_reports_metadata_artwork_and_ready(
         PreparationStage.READY,
     ]
     assert "2 tracks / 2 unique albums" in progress[1].message
+    assert "Spotify metadata:" in caplog.text
