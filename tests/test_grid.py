@@ -8,6 +8,7 @@ from app.mosaic.grid import (
     calculate_render_grid,
     choose_grid,
     maximum_render_density,
+    recommended_density_range,
 )
 
 
@@ -102,25 +103,43 @@ def test_render_grid_density_uses_dimensions_not_album_count() -> None:
     assert grid == GridSpec(rows=11, columns=18, tile_count=198)
 
 
-def test_render_grid_rejects_subthumbnail_cells_on_tiny_video() -> None:
-    with pytest.raises(ValueError, match="cannot exceed 8 tiles"):
-        calculate_render_grid(32, 18, 200)
+def test_render_grid_allows_small_cells_on_low_resolution_video() -> None:
+    grid = calculate_render_grid(32, 18, 200)
+
+    assert grid.tile_count >= 190
+    assert grid.rows <= 18
+    assert grid.columns <= 32
 
 
-def test_render_grid_accepts_density_above_500() -> None:
-    grid = calculate_render_grid(640, 360, 1500)
+@pytest.mark.parametrize("requested", [1000, 1500, 2500, 3000])
+def test_render_grid_accepts_full_density_range(requested: int) -> None:
+    grid = calculate_render_grid(320, 180, requested)
 
-    assert grid == GridSpec(rows=29, columns=52, tile_count=1508)
+    assert abs(grid.tile_count - requested) / requested < 0.02
+    assert grid.tile_count <= 3000
+
+
+@pytest.mark.parametrize("dimensions", [(1920, 1080), (640, 360), (320, 180), (32, 18)])
+def test_hard_density_maximum_does_not_depend_on_video_resolution(
+    dimensions: tuple[int, int],
+) -> None:
+    assert maximum_render_density(*dimensions) == 3000
 
 
 @pytest.mark.parametrize(
-    ("width", "height", "expected"),
-    [(1920, 1080, 3000), (640, 360, 3000), (320, 180, 880), (32, 18, 8)],
+    ("dimensions", "expected"),
+    [
+        ((640, 480), (100, 500)),
+        ((1280, 720), (150, 800)),
+        ((1920, 1080), (250, 1200)),
+        ((3840, 2160), (500, 2400)),
+    ],
 )
-def test_adaptive_density_maximum_uses_video_resolution(
-    width: int, height: int, expected: int
+def test_resolution_aware_density_range_is_recommendation_only(
+    dimensions: tuple[int, int], expected: tuple[int, int]
 ) -> None:
-    assert maximum_render_density(width, height) == expected
+    assert recommended_density_range(*dimensions) == expected
+    assert maximum_render_density(*dimensions) == 3000
 
 
 def test_render_grid_limits_requested_density_to_backend_cap() -> None:
@@ -128,9 +147,11 @@ def test_render_grid_limits_requested_density_to_backend_cap() -> None:
         calculate_render_grid(1920, 1080, 3001)
 
 
-def test_render_grid_enforces_resolution_specific_cap() -> None:
-    with pytest.raises(ValueError, match="cannot exceed 880"):
-        calculate_render_grid(320, 180, 881)
+def test_actual_render_grid_respects_hard_cap_even_for_square_video() -> None:
+    grid = calculate_render_grid(100, 100, 3000)
+
+    assert grid.tile_count <= 3000
+    assert grid.tile_count >= 2900
 
 
 def test_grid_spec_rejects_inconsistent_tile_count() -> None:

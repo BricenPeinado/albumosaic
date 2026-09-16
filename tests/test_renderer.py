@@ -89,6 +89,38 @@ def test_high_density_render_reuses_three_album_tiles() -> None:
     assert result.dtype == np.uint8
 
 
+@pytest.mark.parametrize(
+    ("album_count", "requested", "mode"),
+    [
+        (3, 500, MatchMode.NEAREST),
+        (8, 2000, MatchMode.NEAREST),
+        (20, 3000, MatchMode.UNIQUE_PER_FRAME),
+    ],
+)
+def test_high_density_is_independent_of_small_album_pool(
+    album_count: int, requested: int, mode: MatchMode
+) -> None:
+    tiles = tuple(
+        AlbumTile(str(index), Image.new("RGB", (24, 24), (index * 12, 0, 0)))
+        for index in range(album_count)
+    )
+    plan = MosaicRenderPlan(320, 180, tiles, requested, mode)
+    target_means = np.zeros((plan.grid.tile_count, 3), dtype=np.float32)
+
+    matches = plan.match(target_means)
+    frame = plan.compose_bgr(matches)
+
+    assert len(matches) == plan.grid.tile_count
+    assert set(matches.tolist()) <= set(range(album_count))
+    assert len(plan.album_tiles) == album_count
+    assert all(plan.album_tiles[index] is tiles[index] for index in range(album_count))
+    assert plan.album_index.vectors.shape == (album_count, 3)
+    assert frame.shape == (180, 320, 3)
+    assert frame.dtype == np.uint8
+    if mode is MatchMode.UNIQUE_PER_FRAME:
+        assert set(matches.tolist()) == set(range(album_count))
+
+
 def test_unique_mode_fills_overflow_cells_without_reducing_density() -> None:
     tiles = tuple(
         AlbumTile(str(index), Image.new("RGB", (20, 20), (index * 30, 0, 0)))

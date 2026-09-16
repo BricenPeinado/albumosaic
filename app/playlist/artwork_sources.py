@@ -7,7 +7,9 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
@@ -41,11 +43,30 @@ _ARCHIVE_HOSTS = frozenset({_COVER_ART_HOST, "archive.org"})
 _DEFAULT_RESOLUTION_WORKERS = 4
 _MATCH_CACHE_VERSION = 2
 _MAX_MUSICBRAINZ_SEARCHES = 3
+_MAX_SERVICE_ATTEMPTS = 3
+_INITIAL_RETRY_BACKOFF = 1.5
+_MAX_RETRY_AFTER = 10.0
+_RETRYABLE_SERVICE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MUSICBRAINZ_REQUEST_LOCK = Lock()
+_last_musicbrainz_request = 0.0
+_last_musicbrainz_interval = 0.0
 _EDITION_SUFFIX = re_compile(
     r"(?i)(?:\s*[([]\s*|\s*[-\u2013\u2014]\s*)"
     r"(?:deluxe(?:\s+edition)?|expanded\s+edition|remaster(?:ed)?"
     r"(?:\s+\d{4})?|(?:\d+(?:st|nd|rd|th)\s+)?anniversary\s+edition|"
     r"bonus\s+track\s+version|explicit|clean\s+version)\s*[)\]]?\s*$"
+)
+_SEARCH_EDITION_QUALIFIER = (
+    r"(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?"
+    r"|clean(?:\s+version)?|explicit(?:\s+version)?"
+    r"|deluxe(?:\s+edition)?|expanded(?:\s+edition)?"
+    r"|(?:\d+(?:st|nd|rd|th)\s+)?anniversary(?:\s+edition)?"
+    r"|special\s+edition|bonus\s+track\s+version"
+    r"|collector['\u2019]s\s+edition|mono|stereo"
+)
+_SEARCH_EDITION_SUFFIX = re_compile(
+    rf"(?i)(?:\s*(?:\(|\[)\s*(?:{_SEARCH_EDITION_QUALIFIER})\s*"
+    rf"(?:\)|\])|\s+[-\u2013\u2014]\s*(?:{_SEARCH_EDITION_QUALIFIER}))\s*$"
 )
 
 logger = logging.getLogger(__name__)
@@ -141,7 +162,7 @@ class MusicBrainzArtworkResolver:
         *,
         search_timeout: float = 7.0,
         cover_art_timeout: float = 5.0,
-        minimum_interval: float = 1.0,
+        minimum_interval: float = 1.1,
         confidence_threshold: float = 75.0,
     ) -> None:
         if not contact.strip():
@@ -154,14 +175,15 @@ class MusicBrainzArtworkResolver:
         self.cover_art_timeout = cover_art_timeout
         self.minimum_interval = minimum_interval
         self.confidence_threshold = confidence_threshold
-        self._lock = Lock()
         self._mapping_lock = Lock()
         self._timing_lock = Lock()
         self._mb_calls = 0
         self._mb_seconds = 0.0
+        self._mb_wait_seconds = 0.0
+        self._mb_http_seconds = 0.0
+        self._fallback_searches = 0
         self._caa_calls = 0
         self._caa_seconds = 0.0
-        self._last_request = 0.0
         self._mapping, self._reasons, self._contexts, self._cover_refs = (
             self._load_mapping()
         )
@@ -200,7 +222,7 @@ class MusicBrainzArtworkResolver:
             mbid = found_mbid
         cover_started = perf_counter()
         try:
-            reference = self._cover_reference(mbid)
+            reference = self._cover_reference(mbid, label)
         except ArtworkResolutionError as error:
             logger.debug(
                 "cover_lookup_error: %s after %.2fs",
@@ -221,16 +243,36 @@ class MusicBrainzArtworkResolver:
     def _search_album(self, album: Album, key: str) -> str | None:
         candidates_by_id: dict[str, dict[str, object]] = {}
         seen_queries: set[str] = set()
+        original_title = album.album_name.strip()
+        normalized_title = normalize_album_title_for_search(original_title)
+        last_search_title = original_title
+        logger.debug(
+            'MusicBrainz search titles: original_title="%s" normalized_title="%s"',
+            original_title,
+            normalized_title,
+        )
         for stage, query in enumerate(_search_queries(album), start=1):
             if query in seen_queries:
                 continue
             seen_queries.add(query)
+            normalized_fallback_used = stage > 1 and normalized_title != original_title
+            last_search_title = (
+                normalized_title if normalized_fallback_used else original_title
+            )
+            logger.debug(
+                "MusicBrainz search %d: fallback_normalization_used=%s",
+                stage,
+                normalized_fallback_used,
+            )
+            if stage > 1:
+                with self._timing_lock:
+                    self._fallback_searches += 1
             url = f"https://{_MUSICBRAINZ_HOST}/ws/2/release-group/?" + urlencode(
                 {"query": query, "fmt": "json", "limit": 10}
             )
             started = perf_counter()
             try:
-                payload = self._get_json(url)
+                payload = self._get_json(url, _album_label(album))
             except ArtworkResolutionError as error:
                 logger.debug(
                     "MusicBrainz search %d: %s after %.2fs",
@@ -255,7 +297,10 @@ class MusicBrainzArtworkResolver:
                     if isinstance(mbid, str) and mbid:
                         candidates_by_id[mbid] = item
             winner, reason = _select_candidate(
-                album, candidates_by_id.values(), self.confidence_threshold
+                album,
+                candidates_by_id.values(),
+                self.confidence_threshold,
+                search_title=last_search_title,
             )
             if winner is not None:
                 mbid = winner["id"]
@@ -265,7 +310,10 @@ class MusicBrainzArtworkResolver:
             logger.debug("MusicBrainz search %d: %s", stage, reason)
 
         _, reason = _select_candidate(
-            album, candidates_by_id.values(), self.confidence_threshold
+            album,
+            candidates_by_id.values(),
+            self.confidence_threshold,
+            search_title=last_search_title,
         )
         logger.debug("%s: %s", reason, _album_label(album))
         self._remember(
@@ -293,6 +341,15 @@ class MusicBrainzArtworkResolver:
                 self._caa_seconds,
             )
 
+    def search_diagnostics_snapshot(self) -> tuple[float, float, int]:
+        """Return rate waiting, HTTP time, and fallback-search counts."""
+        with self._timing_lock:
+            return (
+                self._mb_wait_seconds,
+                self._mb_http_seconds,
+                self._fallback_searches,
+            )
+
     def _record_service_timing(self, service: str, elapsed: float) -> None:
         with self._timing_lock:
             if service == "mb":
@@ -302,37 +359,58 @@ class MusicBrainzArtworkResolver:
                 self._caa_calls += 1
                 self._caa_seconds += elapsed
 
-    def _cover_reference(self, mbid: str) -> ArtworkReference | None:
+    def _cover_reference(
+        self, mbid: str, album_label: str = ""
+    ) -> ArtworkReference | None:
         url = f"https://{_COVER_ART_HOST}/release-group/{quote(mbid)}"
         request = Request(
             url,
             headers={"Accept": "application/json", "User-Agent": self.user_agent},
         )
-        try:
-            with open_url(request, timeout=self.cover_art_timeout) as response:
-                final_url = urlparse(response.geturl())
-                final_host = (final_url.hostname or "").lower()
-                if final_url.scheme != "https" or not (
-                    final_host == _COVER_ART_HOST
-                    or final_host == "archive.org"
-                    or final_host.endswith(".archive.org")
-                ):
-                    raise ArtworkResolutionError(
-                        "Refused an unexpected Cover Art Archive redirect"
+        for attempt in range(1, _MAX_SERVICE_ATTEMPTS + 1):
+            try:
+                with open_url(request, timeout=self.cover_art_timeout) as response:
+                    final_url = urlparse(response.geturl())
+                    final_host = (final_url.hostname or "").lower()
+                    if final_url.scheme != "https" or not (
+                        final_host == _COVER_ART_HOST
+                        or final_host == "archive.org"
+                        or final_host.endswith(".archive.org")
+                    ):
+                        raise ArtworkResolutionError(
+                            "Refused an unexpected Cover Art Archive redirect"
+                        )
+                    payload = loads(response.read())
+                if attempt > 1:
+                    logger.debug(
+                        "CAA retry album=%s attempt=%d/%d final outcome=recovered",
+                        album_label,
+                        attempt,
+                        _MAX_SERVICE_ATTEMPTS,
                     )
-                payload = loads(response.read())
-        except HTTPError as error:
-            if error.code == 404:
-                return None
-            raise ArtworkResolutionError(
-                f"Cover Art Archive returned HTTP {error.code}"
-            ) from error
-        except TimeoutError as error:
-            raise ArtworkResolutionError(
-                f"Cover Art Archive timed out after {self.cover_art_timeout:g}s"
-            ) from error
-        except (URLError, OSError, ValueError) as error:
-            raise ArtworkResolutionError("Cover Art Archive request failed") from error
+                break
+            except HTTPError as error:
+                if error.code == 404:
+                    logger.debug(
+                        "CAA HTTP 404 album=%s attempt=%d/%d final outcome=no artwork",
+                        album_label,
+                        attempt,
+                        _MAX_SERVICE_ATTEMPTS,
+                    )
+                    return None
+                if _retry_service_error("CAA", album_label, error, attempt):
+                    continue
+                raise ArtworkResolutionError(
+                    f"Cover Art Archive returned HTTP {error.code}"
+                ) from error
+            except TimeoutError as error:
+                raise ArtworkResolutionError(
+                    f"Cover Art Archive timed out after {self.cover_art_timeout:g}s"
+                ) from error
+            except (URLError, OSError, ValueError) as error:
+                raise ArtworkResolutionError(
+                    "Cover Art Archive request failed"
+                ) from error
         if not isinstance(payload, dict):
             raise ArtworkResolutionError("Cover Art Archive returned invalid JSON")
         images = payload.get("images")
@@ -348,28 +426,66 @@ class MusicBrainzArtworkResolver:
                 return _cover_art_reference(mbid, image_url)
         return None
 
-    def _get_json(self, url: str) -> dict[str, object]:
+    def _get_json(self, url: str, album_label: str = "") -> dict[str, object]:
         if urlparse(url).hostname != _MUSICBRAINZ_HOST:
             raise ArtworkResolutionError("Refused an unexpected MusicBrainz URL")
-        with self._lock:
-            delay = self.minimum_interval - (monotonic() - self._last_request)
-            if delay > 0:
-                sleep(delay)
-            self._last_request = monotonic()
-            request = Request(url, headers={"User-Agent": self.user_agent})
+        for attempt in range(1, _MAX_SERVICE_ATTEMPTS + 1):
             try:
-                with open_url(request, timeout=self.search_timeout) as response:
-                    decoded = loads(response.read())
+                decoded = self._get_json_once(url)
+                if attempt > 1:
+                    logger.debug(
+                        "MusicBrainz retry album=%s attempt=%d/%d "
+                        "final outcome=recovered",
+                        album_label,
+                        attempt,
+                        _MAX_SERVICE_ATTEMPTS,
+                    )
+                return decoded
             except HTTPError as error:
+                if _retry_service_error("MusicBrainz", album_label, error, attempt):
+                    continue
                 raise ArtworkResolutionError(
                     f"MusicBrainz returned HTTP {error.code}"
                 ) from error
+        raise AssertionError("MusicBrainz retry loop exhausted unexpectedly")
+
+    def _get_json_once(self, url: str) -> dict[str, object]:
+        global _last_musicbrainz_interval, _last_musicbrainz_request
+        with _MUSICBRAINZ_REQUEST_LOCK:
+            now = monotonic()
+            if now < _last_musicbrainz_request:
+                # Also permits deterministic test clocks to start afresh.
+                _last_musicbrainz_request = 0.0
+                _last_musicbrainz_interval = 0.0
+            interval = (
+                max(self.minimum_interval, _last_musicbrainz_interval)
+                if self.minimum_interval > 0
+                else 0.0
+            )
+            delay = interval - (now - _last_musicbrainz_request)
+            if delay > 0:
+                wait_started = perf_counter()
+                sleep(delay)
+                with self._timing_lock:
+                    self._mb_wait_seconds += perf_counter() - wait_started
+            _last_musicbrainz_request = monotonic()
+            _last_musicbrainz_interval = self.minimum_interval
+            request = Request(url, headers={"User-Agent": self.user_agent})
+            http_started = perf_counter()
+            try:
+                with open_url(request, timeout=self.search_timeout) as response:
+                    decoded = loads(response.read())
+            except HTTPError:
+                raise
             except TimeoutError as error:
                 raise ArtworkResolutionError(
                     f"MusicBrainz timed out after {self.search_timeout:g}s"
                 ) from error
             except (URLError, OSError, ValueError) as error:
                 raise ArtworkResolutionError("MusicBrainz request failed") from error
+            finally:
+                with self._timing_lock:
+                    self._mb_http_seconds += perf_counter() - http_started
         if not isinstance(decoded, dict):
             raise ArtworkResolutionError("MusicBrainz returned invalid JSON")
         return cast(dict[str, object], decoded)
@@ -505,25 +621,44 @@ class IndependentArtworkProvider:
             for resolver in self.resolvers
             if isinstance(resolver, MusicBrainzArtworkResolver)
         }
+        diagnostic_baselines = {
+            resolver: resolver.search_diagnostics_snapshot()
+            for resolver in service_baselines
+        }
         resolution_started = perf_counter()
-        selected_by_index: dict[int, tuple[Album, ArtworkReference]] = {}
-        with ThreadPoolExecutor(
-            max_workers=min(_DEFAULT_RESOLUTION_WORKERS, total or 1)
-        ) as executor:
+        results_by_index: dict[int, ResolvedArtwork] = {}
+        cache_hits = 0
+        cache_misses = 0
+        first_cache_submission: float | None = None
+        with (
+            ThreadPoolExecutor(
+                max_workers=min(_DEFAULT_RESOLUTION_WORKERS, total or 1)
+            ) as resolution_executor,
+            ThreadPoolExecutor(
+                max_workers=min(_DEFAULT_RESOLUTION_WORKERS, total or 1)
+            ) as cache_executor,
+        ):
             resolution_futures = {
-                executor.submit(self._resolve_one, album, index, total, report): (
+                resolution_executor.submit(
+                    self._resolve_one, album, index, total, report
+                ): (
                     index,
                     album,
                 )
                 for index, album in enumerate(unique_albums)
             }
+            cache_futures = {}
             for completed, resolution_future in enumerate(
                 as_completed(resolution_futures), start=1
             ):
                 index, album = resolution_futures[resolution_future]
                 reference = resolution_future.result()
                 if reference is not None:
-                    selected_by_index[index] = (album, reference)
+                    if first_cache_submission is None:
+                        first_cache_submission = perf_counter()
+                    cache_futures[
+                        cache_executor.submit(self._cache_one, (album, reference))
+                    ] = (index, album)
                 report(
                     PreparationProgress(
                         PreparationStage.RESOLVING_ARTWORK,
@@ -536,18 +671,8 @@ class IndependentArtworkProvider:
                         ),
                     )
                 )
-        resolution_elapsed = perf_counter() - resolution_started
-        selected = [selected_by_index[index] for index in sorted(selected_by_index)]
-
-        download_started = perf_counter()
-        results_by_index: dict[int, ResolvedArtwork] = {}
-        cache_hits = 0
-        cache_misses = 0
-        with ThreadPoolExecutor(max_workers=min(4, len(selected) or 1)) as executor:
-            cache_futures = {
-                executor.submit(self._cache_one, item): (index, item[0])
-                for index, item in enumerate(selected)
-            }
+            resolution_elapsed = perf_counter() - resolution_started
+            selected_count = len(cache_futures)
             for completed, cache_future in enumerate(
                 as_completed(cache_futures), start=1
             ):
@@ -568,18 +693,22 @@ class IndependentArtworkProvider:
                     PreparationProgress(
                         PreparationStage.DOWNLOADING_ARTWORK,
                         completed,
-                        len(selected),
+                        selected_count,
                         (
-                            f"Downloading artwork {completed} / {len(selected)}\n"
+                            f"Downloading artwork {completed} / {selected_count}\n"
                             f"{_album_label(album)}\n"
                             f"cache: {'HIT' if cache_hit else 'MISS'}"
                         ),
                     )
                 )
-        download_elapsed = perf_counter() - download_started
+        download_elapsed = (
+            perf_counter() - first_cache_submission
+            if first_cache_submission is not None
+            else 0.0
+        )
         results = tuple(results_by_index[index] for index in sorted(results_by_index))
         logger.debug(
-            "Artwork summary: resolution %.2fs, download/cache %.2fs, "
+            "Artwork summary: resolution %.2fs, download/cache %.2fs (overlapped), "
             "cache_hits=%d, cache_misses=%d, unresolved=%d/%d",
             resolution_elapsed,
             download_elapsed,
@@ -590,12 +719,20 @@ class IndependentArtworkProvider:
         )
         for resolver, baseline in service_baselines.items():
             current = resolver.service_timing_snapshot()
+            prior_wait, prior_http, prior_fallback = diagnostic_baselines[resolver]
+            wait_seconds, http_seconds, fallback_count = (
+                resolver.search_diagnostics_snapshot()
+            )
             logger.debug(
-                "Artwork service timing: MusicBrainz %d searches / %.3fs cumulative; "
+                "Artwork service timing: MusicBrainz %d searches / %.3fs cumulative "
+                "(HTTP %.3fs, rate wait %.3fs, fallback %d); "
                 "CAA %d metadata lookups / %.3fs cumulative; "
                 "artwork download/cache %.3fs wall",
                 current[0] - baseline[0],
                 current[1] - baseline[1],
+                http_seconds - prior_http,
+                wait_seconds - prior_wait,
+                fallback_count - prior_fallback,
                 current[2] - baseline[2],
                 current[3] - baseline[3],
                 download_elapsed,
@@ -654,10 +791,66 @@ class IndependentArtworkProvider:
         return result, False, perf_counter() - started
 
 
+def _retry_service_error(
+    service: str, album_label: str, error: HTTPError, attempt: int
+) -> bool:
+    if (
+        error.code not in _RETRYABLE_SERVICE_STATUSES
+        or attempt >= _MAX_SERVICE_ATTEMPTS
+    ):
+        outcome = (
+            "skipped (temporary service failure)"
+            if error.code in _RETRYABLE_SERVICE_STATUSES
+            else "skipped (HTTP error)"
+        )
+        logger.debug(
+            "%s HTTP %d album=%s attempt=%d/%d backoff=0s final outcome=%s",
+            service,
+            error.code,
+            album_label,
+            attempt,
+            _MAX_SERVICE_ATTEMPTS,
+            outcome,
+        )
+        return False
+    backoff = _retry_delay(error, attempt)
+    logger.debug(
+        "%s HTTP %d album=%s attempt=%d/%d backoff=%.2fs outcome=retry",
+        service,
+        error.code,
+        album_label,
+        attempt,
+        _MAX_SERVICE_ATTEMPTS,
+        backoff,
+    )
+    sleep(backoff)
+    return True
+
+
+def _retry_delay(error: HTTPError, attempt: int) -> float:
+    default: float = _INITIAL_RETRY_BACKOFF * float(2 ** (attempt - 1))
+    header = error.headers.get("Retry-After") if error.headers is not None else None
+    if header is None:
+        return default
+    try:
+        value = float(header)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(header)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return default
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        value = (retry_at - datetime.now(UTC)).total_seconds()
+    if 0 <= value <= _MAX_RETRY_AFTER:
+        return value
+    return default
+
+
 def _search_queries(album: Album) -> tuple[str, ...]:
     primary_artist = album.artists[0] if album.artists else ""
     full_title = album.album_name.strip()
-    fallback_title = _edition_title(full_title)
+    fallback_title = normalize_album_title_for_search(full_title)
     exact = (
         f'releasegroup:"{_lucene(full_title)}" AND artist:"{_lucene(primary_artist)}"'
     )
@@ -678,9 +871,14 @@ def _select_candidate(
     album: Album,
     candidates: Iterable[dict[str, object]],
     confidence_threshold: float,
+    *,
+    search_title: str | None = None,
 ) -> tuple[dict[str, object] | None, str]:
     ranked = sorted(
-        ((_candidate_score(album, candidate), candidate) for candidate in candidates),
+        (
+            (_candidate_score(album, candidate, search_title), candidate)
+            for candidate in candidates
+        ),
         key=lambda pair: pair[0],
         reverse=True,
     )
@@ -697,18 +895,21 @@ def _select_candidate(
     return ranked[0][1], "resolved"
 
 
-def _candidate_score(album: Album, candidate: dict[str, object]) -> float:
+def _candidate_score(
+    album: Album, candidate: dict[str, object], search_title: str | None = None
+) -> float:
     title = candidate.get("title")
     if not isinstance(title, str):
         return 0.0
-    target_title = _normalize(album.album_name)
+    comparison_title = search_title if search_title is not None else album.album_name
+    target_title = _normalize(comparison_title)
     candidate_title = _normalize(title)
-    if title == album.album_name:
+    if title == comparison_title:
         score = 40.0
     elif candidate_title == target_title:
         score = 36.0
     elif _normalize(_edition_title(title)) == _normalize(
-        _edition_title(album.album_name)
+        _edition_title(comparison_title)
     ):
         score = 32.0
     else:
@@ -788,6 +989,16 @@ def _edition_title(title: str) -> str:
     cleaned = title.strip()
     while True:
         shorter = _EDITION_SUFFIX.sub("", cleaned).strip()
+        if shorter == cleaned or not shorter:
+            return cleaned
+        cleaned = shorter
+
+
+def normalize_album_title_for_search(title: str) -> str:
+    """Remove only recognizable edition/version suffixes for fallback searches."""
+    cleaned = title.strip()
+    while True:
+        shorter = _SEARCH_EDITION_SUFFIX.sub("", cleaned).strip()
         if shorter == cleaned or not shorter:
             return cleaned
         cleaned = shorter

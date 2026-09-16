@@ -27,15 +27,15 @@ available.
 7. Show progress and expose the result for preview and download in Gradio.
 
 The tile-count control remains disabled until playlist resolution succeeds.
-Its initial range is `4` to `1000` requested cells, defaulting to `200`; after
-a video is selected, its maximum adapts to the video's resolution, up to the
-backend hard limit of `3000`. Album library
-size and mosaic density are independent: eight usable covers can reconstruct
-roughly 200 cells, and repeated covers are expected. Changing the source video
-or density refreshes an aspect-aware grid estimate and reports the actual grid
-dimensions and cell count. A high-density status warns that rendering can take
-significantly longer. The backend rejects values above `3000` and high densities
-that would make cells smaller than eight pixels on a small video.
+Its range is `25` to `3000` requested cells, defaulting to `200`, regardless
+of video resolution or album count. The backend rejects requests above `3000`
+and keeps the actual grid at or below 3000 cells. Eight usable covers can
+reconstruct 2000 cells; repeated covers are expected. Changing the source
+video or density refreshes an aspect-aware estimate showing both the requested
+count and actual grid dimensions/count. Resolution-based ranges are guidance
+only (roughly 100-500 tiles for 480p, 150-800 for 720p, 250-1200 for 1080p).
+High densities may render more slowly or make individual cells very small,
+but that warning does not block generation.
 
 ## Architecture
 

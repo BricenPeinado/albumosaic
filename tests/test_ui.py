@@ -6,7 +6,12 @@ from threading import Event
 import gradio as gr
 import pytest
 
-from app.mosaic.grid import GridSpec, calculate_grid, maximum_render_density
+from app.mosaic.grid import (
+    GridSpec,
+    calculate_grid,
+    maximum_render_density,
+    recommended_density_range,
+)
 from app.mosaic.matcher import MatchMode
 from app.playlist.artwork_sources import ResolvedArtwork
 from app.playlist.models import Album, Playlist, Track
@@ -78,6 +83,10 @@ class _FakeWorkflow:
         assert str(video_path) == "video.mp4"
         return maximum_render_density(1920, 1080)
 
+    def recommended_density_for_video(self, video_path: str | Path) -> tuple[int, int]:
+        assert str(video_path) == "video.mp4"
+        return recommended_density_range(1920, 1080)
+
     def generate(self, *args: object, match_mode: MatchMode, **kwargs: object) -> Path:
         del args, kwargs
         self.last_match_mode = match_mode
@@ -97,8 +106,8 @@ def test_density_slider_has_album_independent_default_and_range() -> None:
     )
 
     assert (density["minimum"], density["maximum"], density["value"]) == (
-        4,
-        1000,
+        25,
+        3000,
         200,
     )
 
@@ -122,7 +131,7 @@ def test_playlist_resolution_keeps_density_independent_of_album_count() -> None:
         "Independent artwork found for **3 albums**.  \n"
         "Album library: **3 covers**. Mosaic density: **200 requested tiles**."
     )
-    assert final[2]["minimum"] == 4
+    assert final[2]["minimum"] == 25
     assert final[2]["maximum"] == 3000
     assert final[2]["value"] == 200
     assert final[2]["interactive"] is True
@@ -132,24 +141,28 @@ def test_playlist_resolution_keeps_density_independent_of_album_count() -> None:
     assert final[4]["interactive"] is True
 
 
-def test_video_upload_adapts_slider_maximum_and_clamps_value() -> None:
+def test_video_upload_preserves_full_slider_range_and_selected_density() -> None:
     class SmallVideoWorkflow(_FakeWorkflow):
         def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
             assert str(video_path) == "small.mp4"
             return calculate_grid(320, 180, tile_count)
 
-        def density_limit_for_video(self, video_path: str | Path) -> int:
+        def recommended_density_for_video(
+            self, video_path: str | Path
+        ) -> tuple[int, int]:
             assert str(video_path) == "small.mp4"
-            return maximum_render_density(320, 180)
+            return recommended_density_range(320, 180)
 
     controller = AlbumosaicUIController(SmallVideoWorkflow())  # type: ignore[arg-type]
     summary, button, slider = controller.update_video_readiness(
         "small.mp4", 1500, _playlist(), False
     )
 
-    assert slider["maximum"] == 880
-    assert slider["value"] == 880
-    assert "40 × 22 = 880 actual tiles" in summary
+    assert slider["maximum"] == 3000
+    assert slider["value"] == 1500
+    assert "52 × 29 = 1508 actual tiles" in summary
+    assert "Recommended for this video" in summary
+    assert "produce very small tiles" in summary
     assert button["interactive"] is True
 
 
@@ -161,6 +174,29 @@ def test_high_density_status_warns_about_render_time() -> None:
     assert "Mosaic density: **1500 requested tiles**" in summary
     assert "actual tiles" in summary
     assert "may significantly increase render time" in summary
+
+
+def test_low_resolution_warning_does_not_block_generation() -> None:
+    class SmallVideoWorkflow(_FakeWorkflow):
+        def grid_for_video(self, video_path: str | Path, tile_count: int) -> GridSpec:
+            assert str(video_path) == "small.mp4"
+            return calculate_grid(640, 480, tile_count)
+
+        def recommended_density_for_video(
+            self, video_path: str | Path
+        ) -> tuple[int, int]:
+            assert str(video_path) == "small.mp4"
+            return recommended_density_range(640, 480)
+
+    controller = AlbumosaicUIController(SmallVideoWorkflow())  # type: ignore[arg-type]
+
+    summary, button = controller.update_readiness("small.mp4", 2000, _playlist(), False)
+
+    assert "2000 requested tiles" in summary
+    assert "actual tiles" in summary
+    assert "100-500 tiles" in summary
+    assert "produce very small tiles" in summary
+    assert button["interactive"] is True
 
 
 def test_controller_streams_preparation_progress_before_completion() -> None:

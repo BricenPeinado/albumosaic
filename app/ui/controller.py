@@ -8,6 +8,7 @@ from typing import Any
 
 import gradio as gr
 
+from app.mosaic.grid import MAX_RENDER_DENSITY
 from app.mosaic.matcher import MatchMode
 from app.playlist.models import Playlist
 from app.playlist.progress import (
@@ -17,8 +18,8 @@ from app.playlist.progress import (
 )
 from app.workflow import AlbumosaicWorkflow, PreparedPlaylist, WorkflowProgress
 
-DENSITY_MINIMUM = 4
-DENSITY_MAXIMUM = 1000
+DENSITY_MINIMUM = 25
+DENSITY_MAXIMUM = MAX_RENDER_DENSITY
 DENSITY_DEFAULT = 200
 HIGH_DENSITY_WARNING_THRESHOLD = 1000
 
@@ -167,8 +168,7 @@ class AlbumosaicUIController:
             playlist = prepared.playlist
             album_count = playlist.unique_album_count
             usable_count = prepared.usable_album_count
-            density_max = self._density_max(video_path)
-            selected_count = min(max(DENSITY_MINIMUM, tile_count), density_max)
+            selected_count = min(max(DENSITY_MINIMUM, tile_count), DENSITY_MAXIMUM)
             grid_summary = self.grid_text(
                 video_path, selected_count, prepared, unique_per_frame
             )
@@ -188,7 +188,7 @@ class AlbumosaicUIController:
                 ),
                 gr.update(
                     minimum=DENSITY_MINIMUM,
-                    maximum=density_max,
+                    maximum=DENSITY_MAXIMUM,
                     value=selected_count,
                     interactive=usable_count >= 2,
                 ),
@@ -230,21 +230,12 @@ class AlbumosaicUIController:
         playlist: Playlist | PreparedPlaylist | None,
         unique_per_frame: bool,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
-        """Adapt the slider to the uploaded video's safe resolution ceiling."""
-        density_max = self._density_max(video_path)
-        selected_count = min(max(DENSITY_MINIMUM, tile_count), density_max)
+        """Refresh guidance without lowering the slider's hard maximum."""
+        selected_count = min(max(DENSITY_MINIMUM, tile_count), DENSITY_MAXIMUM)
         summary, button = self.update_readiness(
             video_path, selected_count, playlist, unique_per_frame
         )
-        return summary, button, gr.update(maximum=density_max, value=selected_count)
-
-    def _density_max(self, video_path: str | None) -> int:
-        if not video_path:
-            return DENSITY_MAXIMUM
-        try:
-            return self.workflow.density_limit_for_video(video_path)
-        except Exception:
-            return DENSITY_MAXIMUM
+        return summary, button, gr.update(maximum=DENSITY_MAXIMUM, value=selected_count)
 
     def grid_text(
         self,
@@ -265,6 +256,18 @@ class AlbumosaicUIController:
             f"Mosaic grid: **{grid.columns} × {grid.rows} = "
             f"{grid.tile_count} actual tiles**"
         )
+        try:
+            recommended_min, recommended_max = (
+                self.workflow.recommended_density_for_video(video_path)
+            )
+        except Exception:
+            # Recommendations are advisory and must never disable generation.
+            recommended_max = None
+        else:
+            summary += (
+                f"  \nRecommended for this video: approximately "
+                f"{recommended_min}-{recommended_max} tiles."
+            )
         metadata = (
             playlist.playlist if isinstance(playlist, PreparedPlaylist) else playlist
         )
@@ -288,8 +291,13 @@ class AlbumosaicUIController:
                 f"  \n{usable_count} covers available — "
                 f"up to {repeats} {repeat_label} may be required."
             )
-        if max(tile_count, grid.tile_count) >= HIGH_DENSITY_WARNING_THRESHOLD:
-            summary += "  \nHigh density may significantly increase render time."
+        if max(tile_count, grid.tile_count) >= HIGH_DENSITY_WARNING_THRESHOLD or (
+            recommended_max is not None and tile_count > recommended_max
+        ):
+            summary += (
+                "  \nHigh mosaic density may significantly increase render time "
+                "and produce very small tiles."
+            )
         return summary
 
     def generate(

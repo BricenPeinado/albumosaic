@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from json import dumps, loads
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from time import sleep
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
@@ -80,6 +80,11 @@ def cover_payload(
             }
         ]
     }
+
+
+def http_error(status: int, retry_after: str | None = None) -> HTTPError:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return HTTPError("https://example.invalid", status, "temporary", headers, None)
 
 
 def test_musicbrainz_exact_and_normalized_matches(
@@ -167,6 +172,286 @@ def test_missing_cover_returns_none(
     assert resolver.resolve(album()) is None
 
 
+def test_musicbrainz_503_retries_then_succeeds_without_negative_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mapping_path = tmp_path / "mapping.json"
+    mb_calls = 0
+    waits: list[float] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal mb_calls
+        del timeout
+        if urlparse(request.full_url).hostname == "coverartarchive.org":  # type: ignore[attr-defined]
+            return FakeResponse(cover_payload())
+        mb_calls += 1
+        if mb_calls == 1:
+            raise http_error(503)
+        return FakeResponse({"release-groups": [candidate()]})
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    monkeypatch.setattr(artwork_sources, "sleep", waits.append)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        assert resolver.resolve(album()) is not None
+
+    assert mb_calls == 2
+    assert waits == [1.5]
+    assert "MusicBrainz HTTP 503" in caplog.text
+    assert "final outcome=recovered" in caplog.text
+    saved = loads(mapping_path.read_text(encoding="utf-8"))
+    assert (
+        saved["entries"]["\x1f".join(album().identity_key)]["mbid"]
+        == "release-group-id"
+    )
+
+
+def test_repeated_musicbrainz_503_skips_album_without_negative_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mapping_path = tmp_path / "mapping.json"
+    mb_calls = 0
+    waits: list[float] = []
+
+    def failing_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal mb_calls
+        del request, timeout
+        mb_calls += 1
+        raise http_error(503)
+
+    monkeypatch.setattr(artwork_sources, "open_url", failing_open)
+    monkeypatch.setattr(artwork_sources, "sleep", waits.append)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    provider = IndependentArtworkProvider((resolver,), FakeCache())  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.DEBUG):
+        assert provider.get_many((album(),)) == ()
+
+    assert mb_calls == 3
+    assert waits == [1.5, 3.0]
+    assert "MusicBrainz HTTP 503" in caplog.text
+    assert "final outcome=skipped" in caplog.text
+    assert not mapping_path.exists()
+
+    def recovered_open(request: object, timeout: float) -> FakeResponse:
+        del timeout
+        if urlparse(request.full_url).hostname == "coverartarchive.org":  # type: ignore[attr-defined]
+            return FakeResponse(cover_payload())
+        return FakeResponse({"release-groups": [candidate()]})
+
+    monkeypatch.setattr(artwork_sources, "open_url", recovered_open)
+    next_run = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    assert next_run.resolve(album()) is not None
+
+
+def test_musicbrainz_503_respects_reasonable_retry_after(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    waits: list[float] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal calls
+        del request, timeout
+        calls += 1
+        if calls == 1:
+            raise http_error(503, "2")
+        return FakeResponse({"release-groups": []})
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    monkeypatch.setattr(artwork_sources, "sleep", waits.append)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "mapping.json", minimum_interval=0
+    )
+
+    resolver._get_json("https://musicbrainz.org/ws/2/release-group/?query=test")
+
+    assert calls == 2
+    assert waits == [2.0]
+
+
+def test_musicbrainz_retry_still_obeys_global_request_spacing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    starts: list[float] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        del request, timeout
+        starts.append(clock[0])
+        if len(starts) == 1:
+            raise http_error(503, "0")
+        return FakeResponse({"release-groups": []})
+
+    monkeypatch.setattr(artwork_sources, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        artwork_sources,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "mapping.json"
+    )
+
+    resolver._get_json("https://musicbrainz.org/ws/2/release-group/?query=test")
+
+    assert starts == [100.0, 101.1]
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(), ConnectionResetError()])
+def test_musicbrainz_network_failure_is_not_negative_cached(
+    failure: Exception,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapping_path = tmp_path / "mapping.json"
+
+    def failing_open(request: object, timeout: float) -> FakeResponse:
+        del request, timeout
+        raise failure
+
+    monkeypatch.setattr(artwork_sources, "open_url", failing_open)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    provider = IndependentArtworkProvider((resolver,), FakeCache())  # type: ignore[arg-type]
+
+    assert provider.get_many((album(),)) == ()
+    assert not mapping_path.exists()
+
+
+def test_caa_503_retries_and_preserves_warm_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mapping_path = tmp_path / "mapping.json"
+    caa_calls = 0
+    waits: list[float] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal caa_calls
+        del timeout
+        if urlparse(request.full_url).hostname == "coverartarchive.org":  # type: ignore[attr-defined]
+            caa_calls += 1
+            if caa_calls == 1:
+                raise http_error(503)
+            return FakeResponse(cover_payload())
+        return FakeResponse({"release-groups": [candidate()]})
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    monkeypatch.setattr(artwork_sources, "sleep", waits.append)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    with caplog.at_level(logging.DEBUG):
+        assert resolver.resolve(album()) is not None
+
+    assert caa_calls == 2
+    assert waits == [1.5]
+    assert "CAA HTTP 503" in caplog.text
+    assert "final outcome=recovered" in caplog.text
+    warm = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    monkeypatch.setattr(
+        artwork_sources,
+        "open_url",
+        lambda request, timeout: pytest.fail("warm cache performed network I/O"),
+    )
+    assert warm.resolve(album()) is not None
+
+
+def test_repeated_caa_503_is_not_no_artwork_and_can_recover_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mapping_path = tmp_path / "mapping.json"
+    caa_calls = 0
+    waits: list[float] = []
+
+    def failing_caa(request: object, timeout: float) -> FakeResponse:
+        nonlocal caa_calls
+        del timeout
+        if urlparse(request.full_url).hostname == "coverartarchive.org":  # type: ignore[attr-defined]
+            caa_calls += 1
+            raise http_error(503)
+        return FakeResponse({"release-groups": [candidate()]})
+
+    monkeypatch.setattr(artwork_sources, "open_url", failing_caa)
+    monkeypatch.setattr(artwork_sources, "sleep", waits.append)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    provider = IndependentArtworkProvider((resolver,), FakeCache())  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.DEBUG):
+        assert provider.get_many((album(),)) == ()
+    assert caa_calls == 3
+    assert waits == [1.5, 3.0]
+    assert "CAA HTTP 503" in caplog.text
+    assert "final outcome=skipped" in caplog.text
+    saved = loads(mapping_path.read_text(encoding="utf-8"))
+    assert saved["entries"]["\x1f".join(album().identity_key)] == {
+        "mbid": "release-group-id",
+        "reason": None,
+        "match_context": None,
+    }
+
+    def recovered_caa(request: object, timeout: float) -> FakeResponse:
+        del timeout
+        assert urlparse(request.full_url).hostname == "coverartarchive.org"  # type: ignore[attr-defined]
+        return FakeResponse(cover_payload())
+
+    monkeypatch.setattr(artwork_sources, "open_url", recovered_caa)
+    next_run = MusicBrainzArtworkResolver(
+        "maintainer@example.com", mapping_path, minimum_interval=0
+    )
+    assert next_run.resolve(album()) is not None
+
+
+def test_caa_404_remains_no_artwork_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        nonlocal calls
+        del timeout
+        if urlparse(request.full_url).hostname == "coverartarchive.org":  # type: ignore[attr-defined]
+            calls += 1
+            raise http_error(404)
+        return FakeResponse({"release-groups": [candidate()]})
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "mapping.json", minimum_interval=0
+    )
+
+    assert resolver.resolve(album()) is None
+    assert calls == 1
+    saved = loads((tmp_path / "mapping.json").read_text(encoding="utf-8"))
+    assert (
+        saved["entries"]["\x1f".join(album().identity_key)]["reason"] == "no_cover_art"
+    )
+
+
 def test_interactive_remote_timeouts_are_separate(tmp_path: Path) -> None:
     resolver = MusicBrainzArtworkResolver(
         "maintainer@example.com",
@@ -175,6 +460,7 @@ def test_interactive_remote_timeouts_are_separate(tmp_path: Path) -> None:
 
     assert resolver.search_timeout == 7.0
     assert resolver.cover_art_timeout == 5.0
+    assert resolver.minimum_interval == 1.1
     assert ArtworkCache(tmp_path / "artwork-cache").timeout == 8.0
 
 
@@ -209,6 +495,39 @@ def test_musicbrainz_rate_limit_is_between_request_starts(
     resolver._get_json("https://musicbrainz.org/ws/2/release-group/?query=two")
 
     assert starts == [100.0, 101.0]
+
+
+def test_musicbrainz_rate_limit_is_shared_between_resolvers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    starts: list[float] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        del request, timeout
+        starts.append(clock[0])
+        return FakeResponse({"release-groups": []})
+
+    monkeypatch.setattr(artwork_sources, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        artwork_sources,
+        "sleep",
+        lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    first = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "first.json", minimum_interval=1.0
+    )
+    second = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "second.json", minimum_interval=1.0
+    )
+
+    first._get_json("https://musicbrainz.org/ws/2/release-group/?query=one")
+    second._get_json("https://musicbrainz.org/ws/2/release-group/?query=two")
+
+    assert starts == [100.0, 101.0]
+    assert second.search_diagnostics_snapshot()[0] >= 0
 
 
 def test_local_manifest_takes_priority_and_partial_results_continue(
@@ -602,6 +921,7 @@ def test_edition_fallback_uses_at_most_three_musicbrainz_searches(
 
     assert resolver.resolve(album("The Album (Remastered)")) is None
     assert calls == 3
+    assert resolver.search_diagnostics_snapshot()[2] == 2
 
 
 def test_positive_mapping_without_cover_rechecks_only_caa(
@@ -692,6 +1012,101 @@ def test_deluxe_title_fallback_resolves_without_changing_album_name(
 def test_edition_suffix_is_only_removed_for_matching(suffix: str) -> None:
     title = f"The Album {suffix}"
     assert artwork_sources._edition_title(title) == "The Album"
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Rumours (2013 Remaster)", "Rumours"),
+        ("Album (Clean)", "Album"),
+        ("Album [Explicit]", "Album"),
+        ("Album - Remastered 2011", "Album"),
+        ("Album (Deluxe Edition)", "Album"),
+        ("Album (20th Anniversary Edition)", "Album"),
+        ("Album [Expanded]", "Album"),
+        ("Album (Expanded Edition)", "Album"),
+        ("Album (Special Edition)", "Album"),
+        ("Album (Bonus Track Version)", "Album"),
+        ("Album (Collector's Edition)", "Album"),
+        ("Album (Mono)", "Album"),
+        ("Album (Stereo)", "Album"),
+        ("Album (Deluxe Edition) [Explicit]", "Album"),
+        ("Songs in the Key of Life", "Songs in the Key of Life"),
+        ("A Night at the Opera", "A Night at the Opera"),
+        ("Album (Live at Wembley)", "Album (Live at Wembley)"),
+        ("The Special Edition of Us", "The Special Edition of Us"),
+        ("Remastered Memories", "Remastered Memories"),
+    ],
+)
+def test_normalize_album_title_for_search(title: str, expected: str) -> None:
+    assert artwork_sources.normalize_album_title_for_search(title) == expected
+
+
+def test_year_first_remaster_fallback_uses_original_title_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    queries: list[str] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        del timeout
+        parsed = urlparse(request.full_url)  # type: ignore[attr-defined]
+        if parsed.hostname == "coverartarchive.org":
+            return FakeResponse(cover_payload())
+        query = parse_qs(parsed.query)["query"][0]
+        queries.append(query)
+        return FakeResponse(
+            {"release-groups": [candidate(name="Rumours", artist="Fleetwood Mac")]}
+            if len(queries) == 2
+            else {"release-groups": []}
+        )
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    target = album("Rumours (2013 Remaster)", "Fleetwood Mac")
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "mapping.json", minimum_interval=0
+    )
+    with caplog.at_level(logging.DEBUG):
+        reference = resolver.resolve(target)
+
+    assert reference is not None
+    assert target.album_name == "Rumours (2013 Remaster)"
+    assert len(queries) == 2
+    assert "Rumours" in queries[0] and "2013 Remaster" in queries[0]
+    assert 'releasegroup:"Rumours"' in queries[1]
+    assert 'original_title="Rumours (2013 Remaster)"' in caplog.text
+    assert 'normalized_title="Rumours"' in caplog.text
+    assert "fallback_normalization_used=True" in caplog.text
+
+
+def test_confident_original_title_does_not_trigger_normalized_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queries: list[str] = []
+
+    def fake_open(request: object, timeout: float) -> FakeResponse:
+        del timeout
+        parsed = urlparse(request.full_url)  # type: ignore[attr-defined]
+        if parsed.hostname == "coverartarchive.org":
+            return FakeResponse(cover_payload())
+        queries.append(parse_qs(parsed.query)["query"][0])
+        return FakeResponse(
+            {
+                "release-groups": [
+                    candidate(name="Rumours (2013 Remaster)", artist="Fleetwood Mac")
+                ]
+            }
+        )
+
+    monkeypatch.setattr(artwork_sources, "open_url", fake_open)
+    resolver = MusicBrainzArtworkResolver(
+        "maintainer@example.com", tmp_path / "mapping.json", minimum_interval=0
+    )
+
+    assert resolver.resolve(album("Rumours (2013 Remaster)", "Fleetwood Mac"))
+    assert len(queries) == 1
 
 
 def test_release_year_selects_correct_candidate(
@@ -833,6 +1248,32 @@ def test_preparation_progress_is_incremental_and_downloads_are_concurrent() -> N
     ]
     assert resolution_updates
     assert download_updates[-1].processed == download_updates[-1].total == 20
+
+
+def test_download_starts_while_other_albums_are_still_resolving() -> None:
+    download_started = Event()
+    overlapped = False
+
+    class Resolver:
+        def resolve(self, target: Album) -> ArtworkReference:
+            nonlocal overlapped
+            if target.album_name == "Second":
+                overlapped = download_started.wait(0.5)
+            return ArtworkReference(
+                "test", target.album_name, url="https://example.com/cover.png"
+            )
+
+    class Cache(FakeCache):
+        def get(self, target: Album, reference: ArtworkReference) -> Path:
+            download_started.set()
+            return super().get(target, reference)
+
+    provider = IndependentArtworkProvider((Resolver(),), Cache())  # type: ignore[arg-type]
+
+    results = provider.get_many((album("First"), album("Second")))
+
+    assert len(results) == 2
+    assert overlapped
 
 
 def test_second_pass_reports_artwork_cache_hit_without_redownload() -> None:

@@ -16,6 +16,7 @@ from app.playlist.progress import (
 )
 from app.playlist.source import PlaylistInput, PlaylistSource
 from app.playlist.spotify import SpotifyPlaylistSource
+from app.video.reader import VideoMetadata
 from app.workflow import (
     AlbumosaicWorkflow,
     SpotifyPlaylistResolutionUnavailable,
@@ -153,7 +154,10 @@ def test_generate_reports_all_stages_and_frame_progress(tmp_path: Path) -> None:
     assert progress[-1] == WorkflowProgress(WorkflowStage.FINISHED, 100)
 
 
-def test_workflow_accepts_density_far_above_usable_album_count(tmp_path: Path) -> None:
+@pytest.mark.parametrize("requested", [1000, 1500, 2500, 3000])
+def test_workflow_accepts_density_far_above_usable_album_count(
+    tmp_path: Path, requested: int
+) -> None:
     artwork_paths = (tmp_path / "one.png", tmp_path / "two.png")
     for path in artwork_paths:
         Image.new("RGB", (12, 12), "red").save(path)
@@ -179,11 +183,37 @@ def test_workflow_accepts_density_far_above_usable_album_count(tmp_path: Path) -
     )
     prepared = workflow.prepare_artwork(_playlist())
 
-    assert workflow.generate(prepared, "input.mp4", 1500).is_file()
-    assert observed == [(2, 1500)]
+    assert workflow.generate(prepared, "input.mp4", requested).is_file()
+    assert observed == [(2, requested)]
 
     with pytest.raises(ValueError, match="between 2 and 3000"):
         workflow.generate(prepared, "input.mp4", 3001)
+
+
+def test_low_resolution_video_does_not_reduce_workflow_density_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeReader:
+        metadata = VideoMetadata(320, 180, 30.0, 1, 1 / 30)
+
+        def __init__(self, video_path: str | Path) -> None:
+            assert str(video_path) == "small.mp4"
+
+        def __enter__(self) -> "FakeReader":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    monkeypatch.setattr("app.workflow.VideoReader", FakeReader)
+    workflow = AlbumosaicWorkflow(
+        playlist_source=_PlaylistSource(_playlist()),
+        artwork_provider=_ArtworkProvider(()),
+    )
+
+    assert workflow.density_limit_for_video("small.mp4") == 3000
+    assert workflow.recommended_density_for_video("small.mp4") == (43, 217)
+    assert workflow.grid_for_video("small.mp4", 2500).tile_count >= 2450
 
 
 def test_default_source_uses_spotify_only_when_configured(

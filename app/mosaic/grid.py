@@ -5,7 +5,6 @@ from math import ceil, floor, log, sqrt
 
 _COUNT_ERROR_WEIGHT = 2.0
 MAX_RENDER_DENSITY = 3000
-_MIN_CELL_SIDE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +22,13 @@ class GridSpec:
             raise ValueError("Grid tile count must equal rows multiplied by columns")
 
 
-def calculate_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
+def calculate_grid(
+    width: int,
+    height: int,
+    target_tile_count: int,
+    *,
+    maximum_tile_count: int | None = None,
+) -> GridSpec:
     """Return a grid balancing proximity to N with the video's aspect ratio.
 
     The target is approximate because many values of N, especially primes,
@@ -35,6 +40,8 @@ def calculate_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
         raise ValueError("Video dimensions must be positive")
     if target_tile_count < 2:
         raise ValueError("Target tile count must be at least 2")
+    if maximum_tile_count is not None and maximum_tile_count < 1:
+        raise ValueError("Maximum tile count must be positive")
 
     aspect_ratio = width / height
     ideal_columns = sqrt(target_tile_count * aspect_ratio)
@@ -50,7 +57,11 @@ def calculate_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
         }
 
     def add_candidate(rows: int, columns: int) -> None:
-        if rows <= height and columns <= width:
+        if (
+            rows <= height
+            and columns <= width
+            and (maximum_tile_count is None or rows * columns <= maximum_tile_count)
+        ):
             candidates.add((rows, columns))
 
     max_rows = min(height, ceil(ideal_rows * 2) + 1)
@@ -93,35 +104,43 @@ def calculate_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
 
 
 def calculate_render_grid(width: int, height: int, target_tile_count: int) -> GridSpec:
-    """Apply practical rendering limits without changing aspect-aware grid search."""
+    """Apply only the hard 3000-cell cap to aspect-aware rendering grids."""
     if target_tile_count > MAX_RENDER_DENSITY:
         raise ValueError(f"Mosaic density cannot exceed {MAX_RENDER_DENSITY} tiles")
-    adaptive_limit = maximum_render_density(width, height)
-    if target_tile_count > adaptive_limit:
-        raise ValueError(
-            f"Mosaic density cannot exceed {adaptive_limit} tiles "
-            f"at {width} × {height} pixels"
-        )
-    grid = calculate_grid(width, height, target_tile_count)
-    # Keep legacy two/four-cell rendering usable on tiny images. Higher densities
-    # must not turn each cover into an effectively sub-thumbnail patch.
-    if target_tile_count > 4 and (
-        grid.columns > width // _MIN_CELL_SIDE or grid.rows > height // _MIN_CELL_SIDE
-    ):
-        raise ValueError(
-            f"Mosaic density is too high for {width} × {height} pixels; "
-            f"cells must be at least {_MIN_CELL_SIDE} pixels wide and tall"
-        )
-    return grid
+    return calculate_grid(
+        width,
+        height,
+        target_tile_count,
+        maximum_tile_count=MAX_RENDER_DENSITY,
+    )
 
 
 def maximum_render_density(width: int, height: int) -> int:
-    """Return a resolution-based requested-cell ceiling under the backend cap."""
+    """Return the fixed hard density maximum for valid video dimensions."""
     if width <= 0 or height <= 0:
         raise ValueError("Video dimensions must be positive")
-    capacity = (width // _MIN_CELL_SIDE) * (height // _MIN_CELL_SIDE)
-    # Four low-density cells remain available for legacy tiny-image rendering.
-    return min(MAX_RENDER_DENSITY, max(4, capacity))
+    return MAX_RENDER_DENSITY
+
+
+def recommended_density_range(width: int, height: int) -> tuple[int, int]:
+    """Offer resolution-aware guidance without constraining rendering."""
+    if width <= 0 or height <= 0:
+        raise ValueError("Video dimensions must be positive")
+    pixels = width * height
+    if pixels < 640 * 480:
+        scale = sqrt(pixels / (640 * 480))
+        return max(4, round(100 * scale)), max(4, round(500 * scale))
+    if pixels <= 640 * 480:
+        return 100, 500
+    if pixels <= 1280 * 720:
+        return 150, 800
+    if pixels <= 1920 * 1080:
+        return 250, 1200
+    scale = sqrt(pixels / (1920 * 1080))
+    return (
+        min(MAX_RENDER_DENSITY, round(250 * scale)),
+        min(MAX_RENDER_DENSITY, round(1200 * scale)),
+    )
 
 
 def choose_grid(

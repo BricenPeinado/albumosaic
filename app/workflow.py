@@ -17,6 +17,7 @@ from app.mosaic.grid import (
     GridSpec,
     calculate_render_grid,
     maximum_render_density,
+    recommended_density_range,
 )
 from app.mosaic.matcher import AlbumTile, MatchMode
 from app.mosaic.renderer import validate_blend_alpha
@@ -287,10 +288,16 @@ class AlbumosaicWorkflow:
         return calculate_render_grid(metadata.width, metadata.height, tile_count)
 
     def density_limit_for_video(self, video_path: str | Path) -> int:
-        """Return the current video's adaptive requested-cell ceiling."""
+        """Return the fixed hard density ceiling for a valid video."""
         with VideoReader(video_path) as reader:
             metadata = reader.metadata
         return maximum_render_density(metadata.width, metadata.height)
+
+    def recommended_density_for_video(self, video_path: str | Path) -> tuple[int, int]:
+        """Return optional resolution-aware guidance, not a render limit."""
+        with VideoReader(video_path) as reader:
+            metadata = reader.metadata
+        return recommended_density_range(metadata.width, metadata.height)
 
     def generate(
         self,
